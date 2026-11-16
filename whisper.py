@@ -424,6 +424,34 @@ VOICE_COMMAND_COOLDOWN_SECONDS = 1.0
 VOICE_CONFIRM_COMMANDS = True
 VOICE_PRINT_DEBUG = True
 
+# Requires: sudo apt install -y tesseract-ocr
+ENABLE_OCR_READING = True
+OCR_BINARY = "tesseract"
+OCR_LANGUAGE = "eng"
+OCR_PSM = 3                      # 3 = fully automatic page segmentation
+OCR_TIMEOUT_SECONDS = 10
+OCR_MAX_SPEECH_CHARS = 600       # cap spoken text at a whole-word boundary
+OCR_TRIGGER_COOLDOWN_SECONDS = 2.0
+OCR_READ_PHRASES = (
+    "read this",
+    "read that",
+    "read",
+    "read text",
+    "what does it say",
+    "what's that say",
+)
+
+ENABLE_SCENE_DESCRIBE = True
+SCENE_DESCRIBE_MAX_OBJECTS = 3
+SCENE_DESCRIBE_COOLDOWN_SECONDS = 2.0
+SCENE_DESCRIBE_PHRASES = (
+    "what's there",
+    "what do you see",
+    "describe",
+    "what's around me",
+    "what's ahead",
+)
+
 
 # ============================================================
 # FACE RECOGNITION SETTINGS
@@ -659,6 +687,21 @@ detection_enabled_event.set()
 voice_control_stop_event = threading.Event()
 voice_control_thread = None
 last_voice_command_time = 0.0
+scene_describe_event = threading.Event()
+last_scene_describe_time = 0.0
+
+# Voice-activated OCR reader state. A separate daemon waits for a trigger event,
+# grabs one clean frame, runs Tesseract, and speaks the result. The subprocess is
+# tracked so shutdown can kill a read that is still running.
+ocr_trigger_event = threading.Event()
+ocr_stop_event = threading.Event()
+ocr_worker_thread = None
+ocr_camera_source = None
+last_ocr_trigger_time = 0.0
+current_ocr_process = None
+current_ocr_process_lock = threading.Lock()
+_ocr_available_cache = None
+_ocr_missing_warned = False
 
 
 # ============================================================
@@ -2307,16 +2350,16 @@ def detection_is_enabled():
 
 def set_detection_enabled(enabled, announce=True):
     """Turn all hazard/object detection processing on or off."""
-    changed = detection_is_enabled() != bool(enabled)
+    with state_lock:
+        changed = detection_is_enabled() != bool(enabled)
 
-    if enabled:
-        detection_enabled_event.set()
-    else:
-        detection_enabled_event.clear()
-        # Do not allow old alerts to keep speaking after the user says OFF.
-        clear_waiting_speech()
-        interrupt_current_speech()
-        with state_lock:
+        if enabled:
+            detection_enabled_event.set()
+        else:
+            detection_enabled_event.clear()
+            # Serialize OFF cancellation with on-demand scene speech enqueueing.
+            clear_waiting_speech()
+            interrupt_current_speech()
             track_memory.clear()
             distance_memory.clear()
             track_history.clear()
@@ -2407,11 +2450,60 @@ def _convert_audio_to_16khz_mono_int16(audio):
     return np.clip(np.rint(samples), -32768, 32767).astype(np.int16).tobytes()
 
 
+def _compose_scene_description(objects):
+    if not objects:
+        return "I don't see anything ahead."
+    positions = {
+        "in path": "ahead", "ahead": "ahead",
+        "left side": "to your left", "left": "to your left",
+        "right side": "to your right", "right": "to your right",
+    }
+    distances = {
+        "very_close": "very close", "close": "close",
+        "medium": "a few meters away", "far": "far away",
+    }
+    ordered = sorted(objects, key=lambda item: (-item[4], item[3]))
+    return " ".join(
+        f"{class_name.capitalize()} {positions[position]}, {distances[level]}."
+        for class_name, position, level, distance_m, risk
+        in ordered[:SCENE_DESCRIBE_MAX_OBJECTS]
+    )
+
+
+def _trigger_scene_description():
+    global last_scene_describe_time
+    if not ENABLE_SCENE_DESCRIBE:
+        return False
+    now = time.time()
+    if now - last_scene_describe_time < SCENE_DESCRIBE_COOLDOWN_SECONDS:
+        return True
+    last_scene_describe_time = now
+    scene_describe_event.set()
+    return True
+
+
+def _voice_command_grammar():
+    phrases = ["detection on", "detection off"]
+    if ENABLE_OCR_READING:
+        phrases.extend(OCR_READ_PHRASES)
+    if ENABLE_SCENE_DESCRIBE:
+        phrases.extend(SCENE_DESCRIBE_PHRASES)
+    phrases.append("[unk]")
+    return json.dumps(phrases)
+
+
 def _apply_voice_command(text):
-    """Handle only the two deliberate phrases: detection on / detection off."""
     global last_voice_command_time
 
     command = _normalize_voice_command(text)
+
+    if ENABLE_SCENE_DESCRIBE and command in SCENE_DESCRIBE_PHRASES:
+        return _trigger_scene_description()
+
+    if ENABLE_OCR_READING and command in OCR_READ_PHRASES:
+        _trigger_ocr_reading()
+        return True
+
     if command not in {"detection on", "detection off"}:
         return False
 
@@ -2480,7 +2572,7 @@ def _voice_control_worker():
 
     # Restrict decoding to exactly the phrases this project needs. This makes
     # a small offline model both faster and less prone to accidental commands.
-    command_grammar = json.dumps(["detection on", "detection off", "[unk]"])
+    command_grammar = _voice_command_grammar()
 
     while not voice_control_stop_event.is_set():
         try:
@@ -2578,6 +2670,184 @@ def stop_voice_control():
     voice_control_stop_event.set()
     if voice_control_thread is not None and voice_control_thread.is_alive():
         voice_control_thread.join(timeout=3.0)
+
+
+# ============================================================
+# VOICE-ACTIVATED OCR READING
+# ============================================================
+
+def _ocr_available():
+    """True when the Tesseract binary is on PATH (cached after the first check)."""
+    global _ocr_available_cache, _ocr_missing_warned
+    if _ocr_available_cache is None:
+        _ocr_available_cache = shutil.which(OCR_BINARY) is not None
+        if not _ocr_available_cache and not _ocr_missing_warned:
+            _ocr_missing_warned = True
+            print(
+                f"[ocr] '{OCR_BINARY}' not found; text reading is unavailable. "
+                "Install it with: sudo apt install -y tesseract-ocr",
+                flush=True,
+            )
+    return _ocr_available_cache
+
+
+def _clean_ocr_text(text):
+    """Collapse whitespace and cap spoken length at a whole-word boundary."""
+    words = text.split()
+    if not words:
+        return ""
+    cleaned = " ".join(words)
+    if len(cleaned) <= OCR_MAX_SPEECH_CHARS:
+        return cleaned
+    kept = []
+    length = 0
+    for word in words:
+        added = len(word) + (1 if kept else 0)
+        if length + added > OCR_MAX_SPEECH_CHARS:
+            break
+        kept.append(word)
+        length += added
+    if not kept:
+        return cleaned[:OCR_MAX_SPEECH_CHARS]
+    return " ".join(kept)
+
+
+def _grab_ocr_frame(source):
+    """One clean frame for OCR: peek without consuming, else fall back to read."""
+    if source is None:
+        return None
+    peek = getattr(source, "peek_latest", None)
+    if callable(peek):
+        frame = peek()
+        if frame is not None:
+            return frame
+    ret, frame = source.read()
+    return frame if ret else None
+
+
+def _run_tesseract(frame):
+    """Encode the frame as PNG and pipe it through Tesseract (stdin -> stdout)."""
+    global current_ocr_process
+    ok, buffer = cv2.imencode(".png", frame)
+    if not ok:
+        raise RuntimeError("could not encode frame for OCR")
+    png_bytes = buffer.tobytes()
+
+    command = [
+        OCR_BINARY, "stdin", "stdout",
+        "-l", OCR_LANGUAGE,
+        "--psm", str(OCR_PSM),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    with current_ocr_process_lock:
+        current_ocr_process = process
+    try:
+        try:
+            stdout, _stderr = process.communicate(
+                input=png_bytes, timeout=OCR_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+        if process.returncode != 0:
+            raise RuntimeError(f"tesseract exited with code {process.returncode}")
+        return stdout.decode("utf-8", errors="replace")
+    finally:
+        with current_ocr_process_lock:
+            current_ocr_process = None
+
+
+def _perform_ocr_read(source):
+    """Grab one frame, read it, and speak the result at caution priority (2).
+
+    Risk 2 never interrupts a STOP (risk 3); it queues behind urgent alerts.
+    """
+    if not _ocr_available():
+        play_alert_sound(2, "Text reading isn't available.")
+        return
+
+    frame = _grab_ocr_frame(source)
+    if frame is None:
+        play_alert_sound(2, "I can't see right now.")
+        return
+
+    try:
+        raw_text = _run_tesseract(frame)
+    except Exception:
+        play_alert_sound(2, "I couldn't read that.")
+        return
+
+    text = _clean_ocr_text(raw_text)
+    if not text:
+        play_alert_sound(2, "I don't see any text.")
+        return
+    play_alert_sound(2, text)
+
+
+def _trigger_ocr_reading():
+    """Signal the OCR worker, debounced so one utterance reads one snapshot."""
+    global last_ocr_trigger_time
+    if not ENABLE_OCR_READING:
+        return False
+    now = time.time()
+    if now - last_ocr_trigger_time < OCR_TRIGGER_COOLDOWN_SECONDS:
+        return True
+    last_ocr_trigger_time = now
+    ocr_trigger_event.set()
+    return True
+
+
+def _ocr_reader_worker():
+    while not ocr_stop_event.is_set():
+        triggered = ocr_trigger_event.wait(timeout=0.5)
+        if ocr_stop_event.is_set():
+            break
+        if not triggered:
+            continue
+        ocr_trigger_event.clear()
+        try:
+            _perform_ocr_read(ocr_camera_source)
+        except Exception as error:
+            print(f"[ocr] Reader error: {type(error).__name__}: {error}", flush=True)
+
+
+def start_ocr_reader(source):
+    global ocr_worker_thread, ocr_camera_source
+    if not ENABLE_OCR_READING:
+        return
+    if ocr_worker_thread is not None and ocr_worker_thread.is_alive():
+        return
+    ocr_camera_source = source
+    ocr_stop_event.clear()
+    ocr_trigger_event.clear()
+    ocr_worker_thread = threading.Thread(
+        target=_ocr_reader_worker,
+        name="whisper-hat-ocr-reader",
+        daemon=True,
+    )
+    ocr_worker_thread.start()
+
+
+def stop_ocr_reader():
+    global current_ocr_process
+    ocr_stop_event.set()
+    ocr_trigger_event.set()
+    with current_ocr_process_lock:
+        process = current_ocr_process
+        current_ocr_process = None
+    if process is not None:
+        try:
+            process.kill()
+        except Exception:
+            pass
+    if ocr_worker_thread is not None:
+        ocr_worker_thread.join(timeout=3.0)
 
 
 # ============================================================
@@ -3478,6 +3748,18 @@ class LatestFrameSource:
             self.last_returned_sequence = self.sequence
             return True, self.latest_frame.copy()
 
+    def peek_latest(self):
+        """Return a copy of the newest frame without consuming it.
+
+        read() advances last_returned_sequence so the main loop sees each frame
+        once. The OCR reader must not steal frames or read HUD annotations, so it
+        peeks at a clean copy and leaves the sequence untouched.
+        """
+        with self.condition:
+            if self.latest_frame is None:
+                return None
+            return self.latest_frame.copy()
+
     def release(self):
         self.running = False
         try:
@@ -3739,7 +4021,9 @@ def main():
     print()
     print("Whispering Hat Pi 5 Trixie Camera Module 3 version is running.")
     start_speech_worker()
+    scene_describe_event.clear()
     start_voice_control()
+    start_ocr_reader(source)
     if SPEAK_STARTUP_MESSAGE:
         play_alert_sound(2, "Whispering hat is ready.")
     print("Walking corridor is ON." if USE_WALKING_CORRIDOR else "Walking corridor is OFF.")
@@ -3758,7 +4042,7 @@ def main():
     print()
 
     frame_count = 0
-    last_detections = []
+    last_detections = None
 
     prev_time = time.time()
     fps = 0.0
@@ -3790,12 +4074,23 @@ def main():
                 # Keep the live camera/window running, but do zero object/hazard
                 # processing until the user says ON again.
                 detections = []
-                last_detections = []
+                last_detections = None
             elif detection_ran:
                 detections = extract_detections(run_yolo(model, frame), model.names)
                 last_detections = detections
             else:
                 detections = last_detections
+
+            # None means inference has not run yet, not that the scene is empty.
+            describe_requested = (
+                ENABLE_SCENE_DESCRIBE
+                and scene_describe_event.is_set()
+                and (not detection_enabled or last_detections is not None)
+            )
+            scene_objects = None
+            if describe_requested:
+                scene_describe_event.clear()
+                scene_objects = []
 
             best_risk = 0
             best_reason = ""
@@ -3874,6 +4169,12 @@ def main():
                         tof_snapshot=tof_snapshot,
                         tof_overlap=tof_overlap,
                     )
+
+                    if describe_requested:
+                        scene_objects.append((
+                            class_name, corridor_position, debug["distance_level"],
+                            debug["fake_distance_m"], risk,
+                        ))
 
                     if debug.get("distance_source") == "tof" and debug.get("in_corridor"):
                         nearest_matched_tof_m = min(
@@ -4078,6 +4379,15 @@ def main():
                                 track_id=best_track_id,
                             )
 
+            if describe_requested:
+                with state_lock:
+                    description = (
+                        _compose_scene_description(scene_objects)
+                        if detection_enabled and detection_is_enabled()
+                        else "Detection is off."
+                    )
+                    play_alert_sound(2, description)
+
             # Announce at most one expression per loop. Skip this frame when a
             # safety warning was just queued, then try again on a later stable
             # inference. Emotion messages use risk 0 and remain low priority.
@@ -4119,6 +4429,7 @@ def main():
     finally:
         source.release()
         stop_voice_control()
+        stop_ocr_reader()
         stop_tof_worker()
         stop_speech_worker()
         close_log_file()
