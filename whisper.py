@@ -399,7 +399,11 @@ SPEAK_STARTUP_MESSAGE = True
 
 # PipeWire normally lives in /run/user/<uid>. Explicitly passing this to
 # pw-play fixes silent playback when Python is started from SSH, VNC, or an IDE.
-AUDIO_RUNTIME_DIR = f"/run/user/{os.getuid()}"
+AUDIO_RUNTIME_DIR = (
+    f"/run/user/{os.getuid()}"
+    if hasattr(os, "getuid")
+    else os.environ.get("XDG_RUNTIME_DIR", "")
+)
 PRINT_SPEECH_DEBUG = True
 
 # USB microphone voice-control settings.
@@ -600,6 +604,17 @@ track_memory = {}
 distance_memory = {}
 last_global_alert_time = 0
 last_alert_debug_time = 0.0
+last_cleanup_time = 0.0
+CLEANUP_INTERVAL_SECONDS = 0.5
+
+_corridor_overlay_cache = {}
+_log_file_handle = None
+_log_writer = None
+_speech_program_path = None
+_audio_player_path = None
+_speech_paths_checked = False
+_speech_env_cache = None
+_speech_missing_warned = False
 
 # A single worker speaks queued messages. A priority queue lets STOP and
 # Caution messages move ahead of informational emotion announcements.
@@ -610,11 +625,13 @@ speech_sequence_lock = threading.Lock()
 
 known_face_names = []
 known_face_encodings = []
+known_face_encodings_matrix = None
 face_memory = {}
 emotion_recognizer = None
 emotion_history = defaultdict(lambda: deque(maxlen=EMOTION_HISTORY_LENGTH))
 last_emotion_print = {}
 emotion_speech_memory = {}
+state_lock = threading.RLock()
 
 
 # ToF worker/state. Access to the latest grid is protected by a lock.
@@ -725,25 +742,88 @@ def corridor_position_word(cx, foot_y, frame_width, frame_height):
     return "right side"
 
 
+def corridor_geometry_for_point(cx, foot_y, frame_width, frame_height):
+    """Compute both in_corridor and corridor_position in a single pass."""
+    if not USE_WALKING_CORRIDOR:
+        return True, direction_word(cx, frame_width)
+
+    left_x, right_x = corridor_bounds_at_y(foot_y, frame_width, frame_height)
+    if left_x <= cx <= right_x and foot_y >= CORRIDOR_TOP_Y * frame_height:
+        return True, "in path"
+    if cx < left_x:
+        return False, "left side"
+    return False, "right side"
+
+
 def draw_walking_corridor(frame):
     if not (USE_WALKING_CORRIDOR and DRAW_CORRIDOR):
         return
 
     frame_height, frame_width = frame.shape[:2]
+    cache_key = (
+        frame_height,
+        frame_width,
+        CORRIDOR_TOP_Y,
+        CORRIDOR_TOP_LEFT,
+        CORRIDOR_TOP_RIGHT,
+        CORRIDOR_BOTTOM_LEFT,
+        CORRIDOR_BOTTOM_RIGHT,
+    )
+    cached = _corridor_overlay_cache.get("entry")
+    if cached is None or cached[0] != cache_key:
+        top_y = clamp(int(CORRIDOR_TOP_Y * frame_height), 0, max(0, frame_height - 1))
+        bottom_y = max(0, frame_height - 1)
 
-    top_y = int(CORRIDOR_TOP_Y * frame_height)
-    bottom_y = frame_height - 1
+        top_left = (clamp(int(CORRIDOR_TOP_LEFT * frame_width), 0, max(0, frame_width - 1)), top_y)
+        top_right = (clamp(int(CORRIDOR_TOP_RIGHT * frame_width), 0, max(0, frame_width - 1)), top_y)
+        bottom_left = (clamp(int(CORRIDOR_BOTTOM_LEFT * frame_width), 0, max(0, frame_width - 1)), bottom_y)
+        bottom_right = (clamp(int(CORRIDOR_BOTTOM_RIGHT * frame_width), 0, max(0, frame_width - 1)), bottom_y)
 
-    top_left = (int(CORRIDOR_TOP_LEFT * frame_width), top_y)
-    top_right = (int(CORRIDOR_TOP_RIGHT * frame_width), top_y)
-    bottom_left = (int(CORRIDOR_BOTTOM_LEFT * frame_width), bottom_y)
-    bottom_right = (int(CORRIDOR_BOTTOM_RIGHT * frame_width), bottom_y)
+        pts = np.array([bottom_left, top_left, top_right, bottom_right], dtype=np.int32)
+        roi_x0 = int(np.min(pts[:, 0]))
+        roi_x1 = min(frame_width, int(np.max(pts[:, 0])) + 1)
+        roi_y0 = int(np.min(pts[:, 1]))
+        roi_y1 = min(frame_height, int(np.max(pts[:, 1])) + 1)
 
-    # Subtle translucent overlay.
-    overlay = frame.copy()
-    pts = [bottom_left, top_left, top_right, bottom_right]
-    cv2.fillPoly(overlay, [np.array(pts, dtype=np.int32)], (40, 40, 40))
-    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+        pts_rel = pts - np.array([roi_x0, roi_y0], dtype=np.int32)
+        buf = np.empty((max(1, roi_y1 - roi_y0), max(1, roi_x1 - roi_x0), 3), dtype=np.uint8)
+        cached = (
+            cache_key,
+            top_y,
+            top_left,
+            top_right,
+            bottom_left,
+            bottom_right,
+            roi_x0,
+            roi_x1,
+            roi_y0,
+            roi_y1,
+            pts_rel,
+            buf,
+        )
+        _corridor_overlay_cache["entry"] = cached
+
+    (
+        _,
+        top_y,
+        top_left,
+        top_right,
+        bottom_left,
+        bottom_right,
+        roi_x0,
+        roi_x1,
+        roi_y0,
+        roi_y1,
+        pts_rel,
+        overlay_buf,
+    ) = cached
+
+    # Subtle translucent overlay over only the corridor bounding box.
+    if roi_x1 > roi_x0 and roi_y1 > roi_y0:
+        roi = frame[roi_y0:roi_y1, roi_x0:roi_x1]
+        np.copyto(overlay_buf, roi)
+        cv2.fillPoly(overlay_buf, [pts_rel], (40, 40, 40))
+        cv2.addWeighted(overlay_buf, 0.18, roi, 0.82, 0, roi)
 
     cv2.line(frame, bottom_left, top_left, (255, 255, 255), 2)
     cv2.line(frame, bottom_right, top_right, (255, 255, 255), 2)
@@ -856,16 +936,16 @@ class ToFDepthWorker:
         print(f"[ToF] Running 8x8 depth at requested {frequency} Hz.")
 
     @staticmethod
-    def _reshape_optional(values):
+    def _reshape_optional(values, dtype=None):
         if values is None:
             return None
-        array = np.asarray(values).reshape(-1)
+        array = np.asarray(values, dtype=dtype).reshape(-1)
         if array.size < 64:
             return None
         return array[:64].reshape(8, 8)
 
     def _store_measurement(self, measurement):
-        distances = self._reshape_optional(getattr(measurement, "distance_mm", None))
+        distances = self._reshape_optional(getattr(measurement, "distance_mm", None), dtype=np.float32)
         if distances is None:
             raise RuntimeError("ToF result did not contain 64 distance values")
 
@@ -875,32 +955,43 @@ class ToFDepthWorker:
         status = self._reshape_optional(status_values)
         targets = self._reshape_optional(getattr(measurement, "nb_target_detected", None))
 
-        distances = distances.astype(np.float32)
+        distances = distances.copy()
         valid = np.isfinite(distances)
         valid &= distances >= TOF_MIN_DISTANCE_MM
         valid &= distances <= TOF_MAX_DISTANCE_MM
 
         if status is not None:
-            valid &= np.isin(status, list(TOF_VALID_STATUS_CODES))
+            if len(TOF_VALID_STATUS_CODES) == 2:
+                code_a, code_b = tuple(TOF_VALID_STATUS_CODES)
+                valid &= (status == code_a) | (status == code_b)
+            else:
+                valid &= np.isin(status, tuple(TOF_VALID_STATUS_CODES))
         if targets is not None:
             valid &= targets > 0
 
         distances[~valid] = np.nan
 
         if TOF_FLIP_X:
-            distances = np.fliplr(distances)
+            distances = distances[:, ::-1]
             if status is not None:
-                status = np.fliplr(status)
+                status = status[:, ::-1]
         if TOF_FLIP_Y:
-            distances = np.flipud(distances)
+            distances = distances[::-1, :]
             if status is not None:
-                status = np.flipud(status)
+                status = status[::-1, :]
+
+        distances = np.ascontiguousarray(distances)
+        if status is not None:
+            status = np.ascontiguousarray(status)
+        distances.setflags(write=False)
+        if status is not None:
+            status.setflags(write=False)
 
         with tof_state_lock:
             tof_state["connected"] = True
             tof_state["initialized"] = True
-            tof_state["grid_mm"] = distances.copy()
-            tof_state["status_grid"] = None if status is None else status.copy()
+            tof_state["grid_mm"] = distances
+            tof_state["status_grid"] = status
             tof_state["last_update"] = time.time()
             tof_state["last_error"] = None
             tof_state["frame_counter"] += 1
@@ -914,7 +1005,7 @@ class ToFDepthWorker:
                         measurement = self.sensor.get_ranging_data()
                         self._store_measurement(measurement)
                     else:
-                        time.sleep(0.004)
+                        self.stop_event.wait(0.008)
             except Exception as error:
                 message = f"{type(error).__name__}: {error}"
                 print(f"[ToF error] {message}")
@@ -946,14 +1037,30 @@ def stop_tof_worker():
         tof_worker.stop()
 
 
-def get_tof_snapshot():
-    """Return a safe copy of the latest grid plus age/health information."""
+def _fast_percentile_1d(valid, percentile):
+    """Exact linear-interpolation percentile for tiny 1D float arrays without numpy dispatch overhead."""
+    n = valid.size
+    if n == 1:
+        return float(valid[0])
+    sorted_vals = np.sort(valid)
+    idx = (percentile * 0.01) * (n - 1)
+    lo = int(idx)
+    if lo >= n - 1:
+        return float(sorted_vals[-1])
+    frac = idx - lo
+    if frac == 0.0:
+        return float(sorted_vals[lo])
+    return float(sorted_vals[lo] + frac * (sorted_vals[lo + 1] - sorted_vals[lo]))
+
+
+def get_tof_snapshot(copy_grid=False):
+    """Return the latest immutable grid (or a copy if requested) plus age/health information."""
     with tof_state_lock:
         grid = tof_state["grid_mm"]
         snapshot = {
             "connected": bool(tof_state["connected"]),
             "initialized": bool(tof_state["initialized"]),
-            "grid_mm": None if grid is None else grid.copy(),
+            "grid_mm": None if grid is None else (grid.copy() if copy_grid else grid),
             "last_update": float(tof_state["last_update"]),
             "last_error": tof_state["last_error"],
             "frame_counter": int(tof_state["frame_counter"]),
@@ -970,7 +1077,7 @@ def get_tof_snapshot():
     return snapshot
 
 
-def maybe_print_tof_summary():
+def maybe_print_tof_summary(snapshot=None):
     global last_tof_summary_time
     if not (ENABLE_TOF and TOF_PRINT_SUMMARY):
         return
@@ -979,18 +1086,21 @@ def maybe_print_tof_summary():
         return
     last_tof_summary_time = now
 
-    snapshot = get_tof_snapshot()
+    if snapshot is None:
+        snapshot = get_tof_snapshot()
     grid = snapshot["grid_mm"]
-    if snapshot["fresh"] and grid is not None and np.any(np.isfinite(grid)):
+    if snapshot["fresh"] and grid is not None:
         valid = grid[np.isfinite(grid)]
-        print(
-            "[ToF] "
-            f"closest={np.min(valid) / 1000.0:.2f}m "
-            f"median={np.median(valid) / 1000.0:.2f}m "
-            f"valid={valid.size}/64 "
-            f"fusion={'ON' if TOF_MOUNT_CALIBRATED else 'LOCKED until mounted'}"
-        )
-    elif snapshot["last_error"]:
+        if valid.size > 0:
+            print(
+                "[ToF] "
+                f"closest={np.min(valid) / 1000.0:.2f}m "
+                f"median={_fast_percentile_1d(valid, 50.0) / 1000.0:.2f}m "
+                f"valid={valid.size}/64 "
+                f"fusion={'ON' if TOF_MOUNT_CALIBRATED else 'LOCKED until mounted'}"
+            )
+            return
+    if snapshot["last_error"]:
         print(f"[ToF] unavailable: {snapshot['last_error']}")
     else:
         print("[ToF] waiting for first depth frame...")
@@ -1016,7 +1126,7 @@ def _pixel_to_tof_cell(x, y, overlap):
     return int(clamp(col, 0, 7)), int(clamp(row, 0, 7))
 
 
-def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height):
+def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height, snapshot=None, overlap=None):
     """Match a YOLO box to overlapping ToF cells.
 
     Returns None when the mount has not been calibrated, the box is outside the
@@ -1025,11 +1135,13 @@ def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height):
     if not (ENABLE_TOF and TOF_MOUNT_CALIBRATED):
         return None
 
-    snapshot = get_tof_snapshot()
+    if snapshot is None:
+        snapshot = get_tof_snapshot()
     if not snapshot["fresh"]:
         return None
 
-    overlap = tof_overlap_rectangle(frame_width, frame_height)
+    if overlap is None:
+        overlap = tof_overlap_rectangle(frame_width, frame_height)
     left, top, right, bottom = overlap
 
     box_w = max(1.0, x2 - x1)
@@ -1060,7 +1172,7 @@ def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height):
     if valid.size < TOF_MIN_VALID_CELLS:
         return None
 
-    distance_mm = float(np.percentile(valid, TOF_DISTANCE_PERCENTILE))
+    distance_mm = _fast_percentile_1d(valid, TOF_DISTANCE_PERCENTILE)
     return {
         "distance_m": distance_mm / 1000.0,
         "valid_cells": int(valid.size),
@@ -1071,14 +1183,15 @@ def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height):
     }
 
 
-def tof_unknown_path_distance():
+def tof_unknown_path_distance(snapshot=None):
     if not (
         ENABLE_TOF
         and TOF_MOUNT_CALIBRATED
         and TOF_UNKNOWN_OBSTACLE_ENABLED
     ):
         return None
-    snapshot = get_tof_snapshot()
+    if snapshot is None:
+        snapshot = get_tof_snapshot()
     if not snapshot["fresh"]:
         return None
     grid = snapshot["grid_mm"]
@@ -1090,7 +1203,7 @@ def tof_unknown_path_distance():
     if valid.size < TOF_MIN_VALID_CELLS:
         return None
     return {
-        "distance_m": float(np.percentile(valid, TOF_DISTANCE_PERCENTILE)) / 1000.0,
+        "distance_m": _fast_percentile_1d(valid, TOF_DISTANCE_PERCENTILE) / 1000.0,
         "valid_cells": int(valid.size),
         "age_seconds": snapshot["age_seconds"],
     }
@@ -1192,47 +1305,49 @@ def raw_fake_distance_meters(class_name, x1, y1, x2, y2, frame_width, frame_heig
 def update_distance_memory(distance_key, raw_distance_m, update=True):
     now = time.time()
 
-    if distance_key not in distance_memory:
-        distance_memory[distance_key] = {
-            "raw_distance_m": raw_distance_m,
-            "smooth_distance_m": raw_distance_m,
-            "last_update_time": now,
-            "approach_mps": 0.0,
-        }
-        return raw_distance_m, 0.0
+    with state_lock:
+        if distance_key not in distance_memory:
+            distance_memory[distance_key] = {
+                "raw_distance_m": raw_distance_m,
+                "smooth_distance_m": raw_distance_m,
+                "last_update_time": now,
+                "approach_mps": 0.0,
+            }
+            return raw_distance_m, 0.0
 
-    mem = distance_memory[distance_key]
+        mem = distance_memory[distance_key]
 
-    if not update:
-        return mem["smooth_distance_m"], 0.0
+        if not update:
+            return mem["smooth_distance_m"], mem.get("approach_mps", 0.0)
 
-    last_smooth = mem["smooth_distance_m"]
-    last_time = mem["last_update_time"]
-    dt = max(0.001, now - last_time)
+        last_smooth = mem["smooth_distance_m"]
+        last_time = mem["last_update_time"]
+        dt = max(0.001, now - last_time)
 
-    smooth = DISTANCE_SMOOTH_ALPHA * raw_distance_m + (1.0 - DISTANCE_SMOOTH_ALPHA) * last_smooth
+        smooth = DISTANCE_SMOOTH_ALPHA * raw_distance_m + (1.0 - DISTANCE_SMOOTH_ALPHA) * last_smooth
 
-    # Positive means distance is shrinking, so object is approaching.
-    approach_mps = (last_smooth - smooth) / dt
+        # Positive means distance is shrinking, so object is approaching.
+        approach_mps = (last_smooth - smooth) / dt
 
-    mem["raw_distance_m"] = raw_distance_m
-    mem["smooth_distance_m"] = smooth
-    mem["last_update_time"] = now
-    mem["approach_mps"] = approach_mps
+        mem["raw_distance_m"] = raw_distance_m
+        mem["smooth_distance_m"] = smooth
+        mem["last_update_time"] = now
+        mem["approach_mps"] = approach_mps
 
-    return smooth, approach_mps
+        return smooth, approach_mps
 
 
 def estimate_motion(track_id):
     if track_id == -1:
         return 0, 0, 0, 0
 
-    hist = track_history[track_id]
-    if len(hist) < 2:
-        return 0, 0, 0, 0
+    with state_lock:
+        hist = track_history.get(track_id)
+        if not hist or len(hist) < 2:
+            return 0, 0, 0, 0
 
-    old = hist[0]
-    new = hist[-1]
+        old = hist[0]
+        new = hist[-1]
 
     dx = new["cx"] - old["cx"]
     dy = new["cy"] - old["cy"]
@@ -1241,7 +1356,7 @@ def estimate_motion(track_id):
     new_area = max(1, new["area"])
 
     area_growth = (new_area - old_area) / old_area
-    speed_px = math.sqrt(dx * dx + dy * dy)
+    speed_px = math.hypot(dx, dy)
 
     return dx, dy, area_growth, speed_px
 
@@ -1281,67 +1396,90 @@ CSV_FIELDS = [
 
 
 def ensure_log_file():
+    global _log_file_handle, _log_writer
     if not LOG_CSV:
         return
 
-    path = Path(LOG_FILE)
-    if path.exists():
+    if _log_file_handle is not None and not _log_file_handle.closed:
         return
 
-    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writeheader()
+    path = Path(LOG_FILE)
+    needs_header = not path.exists() or path.stat().st_size == 0
+
+    _log_file_handle = open(LOG_FILE, "a", newline="", encoding="utf-8", buffering=1)
+    _log_writer = csv.DictWriter(_log_file_handle, fieldnames=CSV_FIELDS)
+    if needs_header:
+        _log_writer.writeheader()
+        _log_file_handle.flush()
+
+
+def close_log_file():
+    global _log_file_handle, _log_writer
+    handle = _log_file_handle
+    _log_file_handle = None
+    _log_writer = None
+    if handle is not None and not handle.closed:
+        try:
+            handle.flush()
+            handle.close()
+        except OSError:
+            pass
 
 
 def log_row(event, class_name, confidence, risk, reason, debug, track_id):
     if not LOG_CSV:
         return
 
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writerow({
-            "time": now_str(),
-            "event": event,
-            "class_name": class_name,
-            "confidence": round(confidence, 3),
-            "risk": risk,
-            "reason": reason,
-            "direction": debug["direction"],
-            "corridor_position": debug["corridor_position"],
-            "in_corridor": debug["in_corridor"],
-            "distance_level": debug["distance_level"],
-            "distance_source": debug["distance_source"],
-            "raw_distance_m": round(debug["raw_distance_m"], 2),
-            "fake_distance_m": round(debug["fake_distance_m"], 2),
-            "visual_distance_m": (
-                "" if debug.get("visual_distance_m") is None
-                else round(debug.get("visual_distance_m"), 2)
-            ),
-            "tof_valid_cells": debug.get("tof_valid_cells", 0),
-            "tof_age_seconds": (
-                "" if debug.get("tof_age_seconds") is None
-                else round(debug.get("tof_age_seconds"), 3)
-            ),
-            "ttc_seconds": (
-                "" if not math.isfinite(debug.get("ttc_seconds", float("inf")))
-                else round(debug.get("ttc_seconds"), 2)
-            ),
-            "approach_mps": round(debug["approach_mps"], 2),
-            "area_growth": round(debug["area_growth"], 3),
-            "speed_px": round(debug["speed_px"], 2),
-            "box_h_px": round(debug["box_h_px"], 1),
-            "face_name": debug.get("face_name", ""),
-            "face_distance_score": (
-                "" if debug.get("face_distance_score") is None
-                else round(debug.get("face_distance_score"), 3)
-            ),
-            "emotion": debug.get("emotion", ""),
-            "emotion_confidence": (
-                "" if debug.get("emotion_confidence") is None
-                else round(debug.get("emotion_confidence"), 3)
-            ),
-            "track_id": track_id,
-        })
+    if _log_writer is None:
+        ensure_log_file()
+    if _log_writer is None:
+        return
+
+    _log_writer.writerow({
+        "time": now_str(),
+        "event": event,
+        "class_name": class_name,
+        "confidence": round(confidence, 3),
+        "risk": risk,
+        "reason": reason,
+        "direction": debug["direction"],
+        "corridor_position": debug["corridor_position"],
+        "in_corridor": debug["in_corridor"],
+        "distance_level": debug["distance_level"],
+        "distance_source": debug["distance_source"],
+        "raw_distance_m": round(debug["raw_distance_m"], 2),
+        "fake_distance_m": round(debug["fake_distance_m"], 2),
+        "visual_distance_m": (
+            "" if debug.get("visual_distance_m") is None
+            else round(debug.get("visual_distance_m"), 2)
+        ),
+        "tof_valid_cells": debug.get("tof_valid_cells", 0),
+        "tof_age_seconds": (
+            "" if debug.get("tof_age_seconds") is None
+            else round(debug.get("tof_age_seconds"), 3)
+        ),
+        "ttc_seconds": (
+            "" if not math.isfinite(debug.get("ttc_seconds", float("inf")))
+            else round(debug.get("ttc_seconds"), 2)
+        ),
+        "approach_mps": round(debug["approach_mps"], 2),
+        "area_growth": round(debug["area_growth"], 3),
+        "speed_px": round(debug["speed_px"], 2),
+        "box_h_px": round(debug["box_h_px"], 1),
+        "face_name": debug.get("face_name", ""),
+        "face_distance_score": (
+            "" if debug.get("face_distance_score") is None
+            else round(debug.get("face_distance_score"), 3)
+        ),
+        "emotion": debug.get("emotion", ""),
+        "emotion_confidence": (
+            "" if debug.get("emotion_confidence") is None
+            else round(debug.get("emotion_confidence"), 3)
+        ),
+        "track_id": track_id,
+    })
+    if event == "alert" and _log_file_handle is not None:
+        _log_file_handle.flush()
 
 
 # ============================================================
@@ -1398,14 +1536,33 @@ def apply_corridor_filter(class_name, risk, reason, distance_level, distance_m, 
     return min(risk, 1), f"{class_name} {corridor_position}"
 
 
-def score_risk(class_name, cx, cy, x1, y1, x2, y2, frame_width, frame_height, track_id, distance_key, update_distance):
+def score_risk(
+    class_name,
+    cx,
+    cy,
+    x1,
+    y1,
+    x2,
+    y2,
+    frame_width,
+    frame_height,
+    track_id,
+    distance_key,
+    update_distance,
+    in_corridor=None,
+    corridor_position=None,
+    tof_snapshot=None,
+    tof_overlap=None,
+):
     direction = direction_word(cx, frame_width)
     foot_y = y2
     lower_half = cy > frame_height * LOWER_FRAME_IMPORTANCE
     very_low_object = foot_y > frame_height * VERY_LOW_OBJECT_Y
 
-    in_corridor = object_in_walking_corridor(cx, foot_y, frame_width, frame_height)
-    corridor_position = corridor_position_word(cx, foot_y, frame_width, frame_height)
+    if in_corridor is None or corridor_position is None:
+        in_corridor, corridor_position = corridor_geometry_for_point(
+            cx, foot_y, frame_width, frame_height
+        )
 
     _, _, area_growth, speed_px = estimate_motion(track_id)
 
@@ -1426,6 +1583,8 @@ def score_risk(class_name, cx, cy, x1, y1, x2, y2, frame_width, frame_height, tr
         y2=y2,
         frame_width=frame_width,
         frame_height=frame_height,
+        snapshot=tof_snapshot,
+        overlap=tof_overlap,
     )
 
     if tof_match is not None:
@@ -1642,64 +1801,67 @@ def update_object_memory(alert_key, risk, reason):
     """
     now = time.time()
 
-    if alert_key not in track_memory:
-        track_memory[alert_key] = {
-            "first_seen": now,
-            "last_seen": now,
-            "last_risk": risk,
-            "last_reason": reason,
-            "last_alert_time": 0.0,
-            "last_alert_risk": 0,
-            "last_alert_reason": None,
-            "spoken_count": 0,
-        }
-        return track_memory[alert_key]
+    with state_lock:
+        if alert_key not in track_memory:
+            track_memory[alert_key] = {
+                "first_seen": now,
+                "last_seen": now,
+                "last_risk": risk,
+                "last_reason": reason,
+                "last_alert_time": 0.0,
+                "last_alert_risk": 0,
+                "last_alert_reason": None,
+                "spoken_count": 0,
+            }
+            return track_memory[alert_key]
 
-    mem = track_memory[alert_key]
-    old_risk = mem.get("last_risk", 0)
+        mem = track_memory[alert_key]
+        old_risk = mem.get("last_risk", 0)
 
-    # Restart stabilization only when entering a spoken level for the first
-    # time, or when the danger level escalates.
-    if (
-        risk >= MIN_SPOKEN_RISK
-        and (old_risk < MIN_SPOKEN_RISK or risk > old_risk)
-    ):
-        mem["first_seen"] = now
+        # Restart stabilization only when entering a spoken level for the first
+        # time, or when the danger level escalates.
+        if (
+            risk >= MIN_SPOKEN_RISK
+            and (old_risk < MIN_SPOKEN_RISK or risk > old_risk)
+        ):
+            mem["first_seen"] = now
 
-    mem["last_seen"] = now
-    mem["last_risk"] = risk
-    mem["last_reason"] = reason
+        mem["last_seen"] = now
+        mem["last_risk"] = risk
+        mem["last_reason"] = reason
 
-    return mem
+        return mem
 
 
-def cleanup_stale_memory():
-    now = time.time()
+def cleanup_stale_memory(now=None):
+    if now is None:
+        now = time.time()
 
-    # Forget spoken-alert history only after the hazard has truly disappeared.
-    stale_alert_keys = [
-        key
-        for key, mem in track_memory.items()
-        if now - mem["last_seen"] > ALERT_REARM_AFTER_ABSENT_SECONDS
-    ]
-    for key in stale_alert_keys:
-        del track_memory[key]
+    with state_lock:
+        # Forget spoken-alert history only after the hazard has truly disappeared.
+        stale_alert_keys = [
+            key
+            for key, mem in track_memory.items()
+            if now - mem["last_seen"] > ALERT_REARM_AFTER_ABSENT_SECONDS
+        ]
+        for key in stale_alert_keys:
+            del track_memory[key]
 
-    stale_distance_keys = [
-        key
-        for key, mem in distance_memory.items()
-        if now - mem["last_update_time"] > TRACK_STALE_SECONDS
-    ]
-    for key in stale_distance_keys:
-        del distance_memory[key]
+        stale_distance_keys = [
+            key
+            for key, mem in distance_memory.items()
+            if now - mem["last_update_time"] > TRACK_STALE_SECONDS
+        ]
+        for key in stale_distance_keys:
+            del distance_memory[key]
 
-    stale_history_ids = [
-        track_id
-        for track_id, history in track_history.items()
-        if not history or now - history[-1]["time"] > TRACK_STALE_SECONDS
-    ]
-    for track_id in stale_history_ids:
-        del track_history[track_id]
+        stale_history_ids = [
+            track_id
+            for track_id, history in track_history.items()
+            if not history or now - history[-1]["time"] > TRACK_STALE_SECONDS
+        ]
+        for track_id in stale_history_ids:
+            del track_history[track_id]
 
 
 def alert_text(risk, reason):
@@ -1720,55 +1882,56 @@ def should_alert(alert_key, risk, reason):
         return False
 
     now = time.time()
-    mem = track_memory.get(alert_key)
-    if mem is None:
-        return False
+    with state_lock:
+        mem = track_memory.get(alert_key)
+        if mem is None:
+            return False
 
-    stable_seconds = now - mem["first_seen"]
+        stable_seconds = now - mem["first_seen"]
 
-    if risk >= 3:
-        stable_required = STABLE_SECONDS_FOR_STOP
-        global_gap = GLOBAL_STOP_GAP_SECONDS
-        repeat_seconds = STOP_REPEAT_SECONDS
-    elif risk == 2:
-        stable_required = STABLE_SECONDS_FOR_CAUTION
-        global_gap = GLOBAL_CAUTION_GAP_SECONDS
-        repeat_seconds = CAUTION_REPEAT_SECONDS
-    else:
-        stable_required = STABLE_SECONDS_FOR_NOTICE
-        global_gap = GLOBAL_NOTICE_GAP_SECONDS
-        repeat_seconds = NOTICE_REPEAT_SECONDS
+        if risk >= 3:
+            stable_required = STABLE_SECONDS_FOR_STOP
+            global_gap = GLOBAL_STOP_GAP_SECONDS
+            repeat_seconds = STOP_REPEAT_SECONDS
+        elif risk == 2:
+            stable_required = STABLE_SECONDS_FOR_CAUTION
+            global_gap = GLOBAL_CAUTION_GAP_SECONDS
+            repeat_seconds = CAUTION_REPEAT_SECONDS
+        else:
+            stable_required = STABLE_SECONDS_FOR_NOTICE
+            global_gap = GLOBAL_NOTICE_GAP_SECONDS
+            repeat_seconds = NOTICE_REPEAT_SECONDS
 
-    if stable_seconds < stable_required:
-        return False
+        if stable_seconds < stable_required:
+            return False
 
-    never_spoken = mem["last_alert_time"] == 0
-    risk_escalated = risk > mem["last_alert_risk"]
-    reason_changed = reason != mem.get("last_alert_reason")
-    repeat_due = (
-        REPEAT_ALERTS_WHILE_STILL_PRESENT
-        and mem["last_alert_time"] > 0
-        and now - mem["last_alert_time"] >= repeat_seconds
-    )
-    global_gap_passed = now - last_global_alert_time >= global_gap
+        never_spoken = mem["last_alert_time"] == 0
+        risk_escalated = risk > mem["last_alert_risk"]
+        reason_changed = reason != mem.get("last_alert_reason")
+        repeat_due = (
+            REPEAT_ALERTS_WHILE_STILL_PRESENT
+            and mem["last_alert_time"] > 0
+            and now - mem["last_alert_time"] >= repeat_seconds
+        )
+        global_gap_passed = now - last_global_alert_time >= global_gap
 
-    should_speak = never_spoken or risk_escalated or repeat_due
+        should_speak = never_spoken or risk_escalated or repeat_due
 
-    if SPEAK_ON_SAME_RISK_REASON_CHANGE and reason_changed:
-        should_speak = True
+        if SPEAK_ON_SAME_RISK_REASON_CHANGE and reason_changed:
+            should_speak = True
 
-    if not global_gap_passed and not risk_escalated:
-        return False
+        if not global_gap_passed and not risk_escalated:
+            return False
 
-    if not should_speak:
-        return False
+        if not should_speak:
+            return False
 
-    mem["last_alert_time"] = now
-    mem["last_alert_risk"] = risk
-    mem["last_alert_reason"] = reason
-    mem["spoken_count"] = mem.get("spoken_count", 0) + 1
-    last_global_alert_time = now
-    return True
+        mem["last_alert_time"] = now
+        mem["last_alert_risk"] = risk
+        mem["last_alert_reason"] = reason
+        mem["spoken_count"] = mem.get("spoken_count", 0) + 1
+        last_global_alert_time = now
+        return True
 
 
 
@@ -1796,65 +1959,80 @@ def print_alert_debug(risk, reason, debug):
 
 def _speech_environment():
     """Return an environment that can connect to the user's PipeWire session."""
-    env = os.environ.copy()
-    env["XDG_RUNTIME_DIR"] = AUDIO_RUNTIME_DIR
-    env.setdefault(
-        "DBUS_SESSION_BUS_ADDRESS",
-        f"unix:path={AUDIO_RUNTIME_DIR}/bus",
-    )
-    return env
+    global _speech_env_cache
+    if _speech_env_cache is None:
+        env = os.environ.copy()
+        if AUDIO_RUNTIME_DIR:
+            env["XDG_RUNTIME_DIR"] = AUDIO_RUNTIME_DIR
+            env.setdefault(
+                "DBUS_SESSION_BUS_ADDRESS",
+                f"unix:path={AUDIO_RUNTIME_DIR}/bus",
+            )
+        _speech_env_cache = env
+    return _speech_env_cache
+
+
+def _get_speech_binaries():
+    global _speech_program_path, _audio_player_path, _speech_paths_checked
+    if not _speech_paths_checked:
+        _speech_program_path = shutil.which("espeak-ng") or shutil.which("espeak")
+        _audio_player_path = shutil.which("pw-play")
+        _speech_paths_checked = True
+    return _speech_program_path, _audio_player_path
+
+
+def _preferred_speech_temp_dir():
+    """Prefer RAM-backed tmpfs directories on Raspberry Pi to avoid SD card writes."""
+    if AUDIO_RUNTIME_DIR and os.path.isdir(AUDIO_RUNTIME_DIR) and os.access(AUDIO_RUNTIME_DIR, os.W_OK):
+        return AUDIO_RUNTIME_DIR
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm"
+    return None
 
 
 def _speak_message_now(message):
-    """Generate a WAV and play it; STOP can terminate the active player."""
-    global current_audio_process
+    """Stream synthesized WAV audio directly into pw-play; fall back to tmpfs WAV if needed."""
+    global current_audio_process, _speech_missing_warned
 
-    speech_program = shutil.which("espeak-ng") or shutil.which("espeak")
-    audio_player = shutil.which("pw-play")
+    speech_program, audio_player = _get_speech_binaries()
 
-    if speech_program is None:
-        print("[speech error] espeak-ng/espeak was not found.")
-        return
-    if audio_player is None:
-        print("[speech error] pw-play was not found.")
+    if speech_program is None or audio_player is None:
+        if not _speech_missing_warned:
+            missing = "espeak-ng/espeak" if speech_program is None else "pw-play"
+            print(f"[speech error] {missing} was not found; speech is disabled.")
+            _speech_missing_warned = True
         return
 
     wav_path = None
+    synth_proc = None
     try:
         if PRINT_SPEECH_DEBUG:
             print(f"[speech start] {message}")
 
-        with tempfile.NamedTemporaryFile(
-            prefix="whisper_hat_", suffix=".wav", delete=False
-        ) as temp_file:
-            wav_path = temp_file.name
-
-        speech_result = subprocess.run(
-            [
-                speech_program,
-                "-v", SPEECH_VOICE,
-                "-s", str(SPEECH_RATE),
-                "-w", wav_path,
-                message,
-            ],
-            stdout=subprocess.DEVNULL,
+        synth_cmd = [
+            speech_program,
+            "-v", SPEECH_VOICE,
+            "-s", str(SPEECH_RATE),
+            "--stdout",
+            message,
+        ]
+        synth_proc = subprocess.Popen(
+            synth_cmd,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-            check=False,
         )
-        if speech_result.returncode != 0:
-            error_text = speech_result.stderr.strip() or "unknown eSpeak error"
-            print(f"[speech error] WAV generation failed: {error_text}")
-            return
-
+        # ponytail: direct pipe avoids SD writes; falls back to tmpfs file only if pw-play rejects '-'
         process = subprocess.Popen(
-            [audio_player, "--target=auto", wav_path],
+            [audio_player, "--target=auto", "-"],
+            stdin=synth_proc.stdout,
             env=_speech_environment(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
         )
+        if synth_proc.stdout is not None:
+            synth_proc.stdout.close()
+
         with current_audio_lock:
             current_audio_process = process
 
@@ -1869,6 +2047,71 @@ def _speak_message_now(message):
                 process.communicate()
             print("[speech error] speech playback timed out.")
             return
+        finally:
+            if synth_proc.poll() is None:
+                synth_proc.terminate()
+            try:
+                _, synth_err_bytes = synth_proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                synth_proc.kill()
+                _, synth_err_bytes = synth_proc.communicate()
+
+        if synth_proc.returncode not in (0, -13, -15):
+            synth_err = (synth_err_bytes or b"").decode("utf-8", errors="replace").strip()
+            print(f"[speech error] synthesis failed: {synth_err or synth_proc.returncode}")
+            return
+
+        # Fallback if an older pw-play version does not accept '-' stdin streaming.
+        if process.returncode not in (0, -15) and "-" in (stderr or ""):
+            with current_audio_lock:
+                current_audio_process = None
+            with tempfile.NamedTemporaryFile(
+                prefix="whisper_hat_",
+                suffix=".wav",
+                dir=_preferred_speech_temp_dir(),
+                delete=False,
+            ) as temp_file:
+                wav_path = temp_file.name
+
+            speech_result = subprocess.run(
+                [
+                    speech_program,
+                    "-v", SPEECH_VOICE,
+                    "-s", str(SPEECH_RATE),
+                    "-w", wav_path,
+                    message,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if speech_result.returncode != 0:
+                error_text = speech_result.stderr.strip() or "unknown eSpeak error"
+                print(f"[speech error] WAV generation failed: {error_text}")
+                return
+
+            process = subprocess.Popen(
+                [audio_player, "--target=auto", wav_path],
+                env=_speech_environment(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            with current_audio_lock:
+                current_audio_process = process
+            try:
+                _stdout, stderr = process.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                print("[speech error] speech playback timed out.")
+                return
 
         # A STOP interruption terminates pw-play, so a nonzero code is expected.
         if process.returncode not in (0, -15):
@@ -1883,6 +2126,12 @@ def _speak_message_now(message):
     except Exception as error:
         print(f"[speech error] {type(error).__name__}: {error}")
     finally:
+        if synth_proc is not None and synth_proc.poll() is None:
+            try:
+                synth_proc.kill()
+                synth_proc.wait(timeout=1)
+            except Exception:
+                pass
         with current_audio_lock:
             current_audio_process = None
         if wav_path:
@@ -1903,6 +2152,10 @@ def _speech_worker():
                 return
 
             _speak_message_now(message)
+        except Exception as error:
+            # Keep the worker alive so one bad message cannot silence every
+            # future alert during a long run.
+            print(f"[speech error] worker: {type(error).__name__}: {error}")
         finally:
             speech_queue.task_done()
 
@@ -2063,12 +2316,14 @@ def set_detection_enabled(enabled, announce=True):
         # Do not allow old alerts to keep speaking after the user says OFF.
         clear_waiting_speech()
         interrupt_current_speech()
-        track_memory.clear()
-        distance_memory.clear()
-        track_history.clear()
-        face_memory.clear()
-        emotion_history.clear()
-        emotion_speech_memory.clear()
+        with state_lock:
+            track_memory.clear()
+            distance_memory.clear()
+            track_history.clear()
+            face_memory.clear()
+            emotion_history.clear()
+            last_emotion_print.clear()
+            emotion_speech_memory.clear()
 
     if changed:
         state = "ON" if enabled else "OFF"
@@ -2095,6 +2350,61 @@ def _select_voice_microphone_index():
 
 def _normalize_voice_command(text):
     return " ".join(text.lower().strip().split())
+
+
+def _antialias_lowpass(samples, rate, target_rate, num_taps=64):
+    """Windowed-sinc FIR low-pass at the output Nyquist (numpy-only, no scipy).
+
+    Downsampling without band-limiting folds everything above target_rate/2 back
+    into the speech band as aliasing, which hurts Vosk. This removes it first.
+    Unity DC gain keeps in-band level unchanged; mode='same' preserves length and
+    alignment. Chunks shorter than the kernel are returned untouched so a tiny
+    buffer never grows to the kernel length.
+    """
+    if samples.size < num_taps:
+        return samples
+    fc = (target_rate / 2.0) / rate
+    center = (num_taps - 1) / 2.0
+    n = np.arange(num_taps, dtype=np.float64) - center
+    kernel = 2.0 * fc * np.sinc(2.0 * fc * n)
+    kernel *= np.hamming(num_taps)
+    kernel /= kernel.sum()
+    return np.convolve(samples, kernel.astype(np.float32), mode="same")
+
+
+def _convert_audio_to_16khz_mono_int16(audio):
+    """Convert SpeechRecognition AudioData to 16 kHz 16-bit mono PCM without audioop."""
+    raw = audio.frame_data
+    width = int(audio.sample_width)
+    rate = int(audio.sample_rate)
+
+    if rate == VOICE_RECOGNITION_SAMPLE_RATE and width == 2:
+        return raw
+
+    if width == 2:
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    elif width == 1:
+        samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) * 256.0
+    elif width == 4:
+        samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 65536.0
+    else:
+        return audio.get_raw_data(
+            convert_rate=VOICE_RECOGNITION_SAMPLE_RATE,
+            convert_width=2,
+        )
+
+    if samples.size == 0:
+        return b""
+
+    if rate != VOICE_RECOGNITION_SAMPLE_RATE:
+        if rate > VOICE_RECOGNITION_SAMPLE_RATE:
+            samples = _antialias_lowpass(samples, rate, VOICE_RECOGNITION_SAMPLE_RATE)
+        out_len = max(1, int(round(samples.size * VOICE_RECOGNITION_SAMPLE_RATE / rate)))
+        x_old = np.arange(samples.size, dtype=np.float32)
+        x_new = np.linspace(0.0, float(samples.size - 1), out_len, dtype=np.float32)
+        samples = np.interp(x_new, x_old, samples)
+
+    return np.clip(np.rint(samples), -32768, 32767).astype(np.int16).tobytes()
 
 
 def _apply_voice_command(text):
@@ -2168,60 +2478,59 @@ def _voice_control_worker():
         )
         return
 
-    try:
-        with open_microphone_quietly(microphone) as source:
-            print("[voice control] Calibrating USB microphone for ambient noise...", flush=True)
-            recognizer.adjust_for_ambient_noise(
-                source,
-                duration=VOICE_AMBIENT_CALIBRATION_SECONDS,
-            )
-            if VOICE_PRINT_DEBUG:
-                print(f"[voice control] Energy threshold: {recognizer.energy_threshold:.1f}")
-    except Exception as error:
-        print(f"[voice control] Microphone calibration warning: {error}")
-
     # Restrict decoding to exactly the phrases this project needs. This makes
     # a small offline model both faster and less prone to accidental commands.
     command_grammar = json.dumps(["detection on", "detection off", "[unk]"])
 
-    print(
-        '[voice control] OFFLINE Vosk ready. Say "detection off" or "detection on".',
-        flush=True,
-    )
-
     while not voice_control_stop_event.is_set():
         try:
             with open_microphone_quietly(microphone) as source:
-                audio = recognizer.listen(
+                print("[voice control] Calibrating USB microphone for ambient noise...", flush=True)
+                recognizer.adjust_for_ambient_noise(
                     source,
-                    timeout=VOICE_LISTEN_TIMEOUT,
-                    phrase_time_limit=VOICE_PHRASE_TIME_LIMIT,
+                    duration=VOICE_AMBIENT_CALIBRATION_SECONDS,
+                )
+                if VOICE_PRINT_DEBUG:
+                    print(f"[voice control] Energy threshold: {recognizer.energy_threshold:.1f}")
+
+                print(
+                    '[voice control] OFFLINE Vosk ready. Say "detection off" or "detection on".',
+                    flush=True,
                 )
 
-            # Convert the captured audio locally to the PCM format Vosk expects.
-            raw_audio = audio.get_raw_data(
-                convert_rate=VOICE_RECOGNITION_SAMPLE_RATE,
-                convert_width=2,
-            )
+                # Keep the ALSA/PipeWire capture stream open across listen cycles
+                # instead of reopening PyAudio (and duplicating stderr FDs) every second.
+                while not voice_control_stop_event.is_set():
+                    try:
+                        audio = recognizer.listen(
+                            source,
+                            timeout=VOICE_LISTEN_TIMEOUT,
+                            phrase_time_limit=VOICE_PHRASE_TIME_LIMIT,
+                        )
+                    except sr.WaitTimeoutError:
+                        continue
 
-            offline_recognizer = KaldiRecognizer(
-                vosk_model,
-                VOICE_RECOGNITION_SAMPLE_RATE,
-                command_grammar,
-            )
-            offline_recognizer.AcceptWaveform(raw_audio)
-            result = json.loads(offline_recognizer.FinalResult())
-            text = _normalize_voice_command(result.get("text", ""))
+                    # Convert the captured audio locally to the PCM format Vosk expects.
+                    raw_audio = _convert_audio_to_16khz_mono_int16(audio)
 
-            if VOICE_PRINT_DEBUG and text:
-                print(f"[voice heard offline] {text}")
+                    offline_recognizer = KaldiRecognizer(
+                        vosk_model,
+                        VOICE_RECOGNITION_SAMPLE_RATE,
+                        command_grammar,
+                    )
+                    offline_recognizer.AcceptWaveform(raw_audio)
+                    result = json.loads(offline_recognizer.FinalResult())
+                    text = _normalize_voice_command(result.get("text", ""))
 
-            if text:
-                _apply_voice_command(text)
+                    if VOICE_PRINT_DEBUG and text:
+                        print(f"[voice heard offline] {text}")
 
-        except sr.WaitTimeoutError:
-            continue
+                    if text:
+                        _apply_voice_command(text)
+
         except Exception as error:
+            if voice_control_stop_event.is_set():
+                break
             print(f"[voice control] Offline microphone/recognition error: {error}")
             voice_control_stop_event.wait(1.0)
 
@@ -2357,22 +2666,18 @@ def draw_object_box(frame, x1, y1, x2, y2, class_name, conf, risk, track_id, deb
 
 
 
-def draw_tof_overlay(frame):
+def draw_tof_overlay(frame, snapshot=None, overlap=None):
     """Draw approximate camera/ToF overlap and the latest depth grid."""
     if not ENABLE_TOF:
         return
     frame_height, frame_width = frame.shape[:2]
-    left, top, right, bottom = tof_overlap_rectangle(frame_width, frame_height)
+    if overlap is None:
+        overlap = tof_overlap_rectangle(frame_width, frame_height)
+    left, top, right, bottom = overlap
     color = (255, 200, 0) if TOF_MOUNT_CALIBRATED else (150, 150, 150)
-    cv2.rectangle(
-        frame,
-        (int(left), int(top)),
-        (int(right), int(bottom)),
-        color,
-        1,
-    )
 
-    snapshot = get_tof_snapshot()
+    if snapshot is None:
+        snapshot = get_tof_snapshot()
     label = "ToF calibrated" if TOF_MOUNT_CALIBRATED else "ToF overlap estimate - fusion locked"
     if snapshot["fresh"]:
         label += f" | age {snapshot['age_seconds']:.2f}s"
@@ -2388,23 +2693,36 @@ def draw_tof_overlay(frame):
 
     grid = snapshot["grid_mm"]
     if not snapshot["fresh"] or grid is None:
+        cv2.rectangle(
+            frame,
+            (int(left), int(top)),
+            (int(right), int(bottom)),
+            color,
+            1,
+        )
         return
 
     cell_w = (right - left) / 8.0
     cell_h = (bottom - top) / 8.0
+    xs = [int(left + i * cell_w) for i in range(9)]
+    ys = [int(top + i * cell_h) for i in range(9)]
+    for x in xs:
+        cv2.line(frame, (x, ys[0]), (x, ys[8]), color, 1)
+    for y in ys:
+        cv2.line(frame, (xs[0], y), (xs[8], y), color, 1)
+
+    grid_rows = grid.tolist()
     for row in range(8):
+        y0, y1 = ys[row], ys[row + 1]
+        text_y = min(y1 - 2, y0 + 13)
+        row_vals = grid_rows[row]
         for col in range(8):
-            x0 = int(left + col * cell_w)
-            y0 = int(top + row * cell_h)
-            x1 = int(left + (col + 1) * cell_w)
-            y1 = int(top + (row + 1) * cell_h)
-            cv2.rectangle(frame, (x0, y0), (x1, y1), color, 1)
-            value = grid[row, col]
-            if np.isfinite(value):
+            value = row_vals[col]
+            if math.isfinite(value):
                 cv2.putText(
                     frame,
-                    f"{value / 1000.0:.1f}",
-                    (x0 + 2, min(y1 - 2, y0 + 13)),
+                    f"{value * 0.001:.1f}",
+                    (xs[col] + 2, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.27,
                     color,
@@ -2422,9 +2740,14 @@ class EmotionRecognizer:
         self.interpreter = None
         self.input_details = None
         self.output_details = None
+        self.input_index = 0
+        self.output_index = 0
         self.input_height = 48
         self.input_width = 48
         self.input_channels = 1
+        self.input_buffer = None
+        self.input_lut = None
+        self.normalization_mode = None
 
         if not ENABLE_EMOTION_RECOGNITION:
             print("Emotion recognition disabled.")
@@ -2444,17 +2767,29 @@ class EmotionRecognizer:
             return
 
         try:
+            # LiteRT/TFLite's default (AUTO/BUILTIN) op resolver already applies
+            # the XNNPACK delegate, and the Python Interpreter exposes no
+            # apply_xnnpack_delegate(); num_threads is the only CPU knob here.
             self.interpreter = Interpreter(model_path=str(model_path), num_threads=2)
             self.interpreter.allocate_tensors()
             self.input_details = self.interpreter.get_input_details()[0]
             self.output_details = self.interpreter.get_output_details()[0]
+            self.input_index = int(self.input_details["index"])
+            self.output_index = int(self.output_details["index"])
 
             shape = self.input_details["shape"]
-            # Expected NHWC, usually [1, 48, 48, 1].
+            # Expected NHWC, usually [1, 48, 48, 1] or [1, 64, 64, 1].
             if len(shape) == 4:
                 self.input_height = int(shape[1])
                 self.input_width = int(shape[2])
                 self.input_channels = int(shape[3])
+
+            input_dtype = self.input_details["dtype"]
+            self.input_buffer = np.empty(
+                (1, self.input_height, self.input_width, self.input_channels),
+                dtype=input_dtype,
+            )
+            self._build_input_lut(EMOTION_INPUT_NORMALIZATION)
 
             self.enabled = True
             print(
@@ -2467,6 +2802,31 @@ class EmotionRecognizer:
             print(f"Could not load emotion model: {e}")
             self.enabled = False
 
+    def _build_input_lut(self, mode):
+        levels = np.arange(256, dtype=np.float32)
+        if mode == "minus_one_to_one":
+            float_lut = (levels / 255.0 - 0.5) * 2.0
+        elif mode == "zero_to_one":
+            float_lut = levels / 255.0
+        elif mode == "raw":
+            float_lut = levels
+        else:
+            raise ValueError(f"Unknown EMOTION_INPUT_NORMALIZATION: {mode}")
+
+        input_dtype = self.input_details["dtype"]
+        scale, zero_point = self.input_details.get("quantization", (0.0, 0))
+
+        if np.issubdtype(input_dtype, np.floating):
+            self.input_lut = float_lut.astype(input_dtype)
+        else:
+            if scale and scale > 0:
+                quant = np.round(float_lut / scale + zero_point)
+            else:
+                quant = np.arange(256, dtype=np.float32)
+            limits = np.iinfo(input_dtype)
+            self.input_lut = np.clip(quant, limits.min, limits.max).astype(input_dtype)
+        self.normalization_mode = mode
+
     @staticmethod
     def _softmax(values):
         values = np.asarray(values, dtype=np.float32)
@@ -2475,19 +2835,31 @@ class EmotionRecognizer:
         total = np.sum(exp)
         return exp / total if total > 0 else exp
 
-    def predict(self, face_bgr):
-        if not self.enabled or face_bgr is None or face_bgr.size == 0:
+    def predict(self, face_bgr, face_gray=None):
+        if not self.enabled:
+            return None, None
+        if self.input_channels == 1 and face_gray is not None:
+            if face_gray.size == 0:
+                return None, None
+        elif face_bgr is None or face_bgr.size == 0:
             return None, None
 
         try:
+            if self.normalization_mode != EMOTION_INPUT_NORMALIZATION:
+                self._build_input_lut(EMOTION_INPUT_NORMALIZATION)
+
             if self.input_channels == 1:
-                image = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+                gray = (
+                    face_gray
+                    if face_gray is not None
+                    else cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+                )
                 image = cv2.resize(
-                    image,
+                    gray,
                     (self.input_width, self.input_height),
                     interpolation=cv2.INTER_AREA,
                 )
-                image = image[..., np.newaxis]
+                np.take(self.input_lut, image, out=self.input_buffer[0, ..., 0])
             else:
                 image = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
                 image = cv2.resize(
@@ -2495,56 +2867,29 @@ class EmotionRecognizer:
                     (self.input_width, self.input_height),
                     interpolation=cv2.INTER_AREA,
                 )
+                np.take(self.input_lut, image, out=self.input_buffer[0])
 
-            input_dtype = self.input_details["dtype"]
-            scale, zero_point = self.input_details.get("quantization", (0.0, 0))
-
-            float_image = image.astype(np.float32)
-
-            if EMOTION_INPUT_NORMALIZATION == "minus_one_to_one":
-                float_image = (float_image / 255.0 - 0.5) * 2.0
-            elif EMOTION_INPUT_NORMALIZATION == "zero_to_one":
-                float_image = float_image / 255.0
-            elif EMOTION_INPUT_NORMALIZATION == "raw":
-                pass
-            else:
-                raise ValueError(
-                    "Unknown EMOTION_INPUT_NORMALIZATION: "
-                    f"{EMOTION_INPUT_NORMALIZATION}"
-                )
-
-            if np.issubdtype(input_dtype, np.floating):
-                tensor = float_image.astype(input_dtype)
-            else:
-                # Quantized model: map the normalized floating-point values
-                # into the tensor's quantized integer range.
-                if scale and scale > 0:
-                    tensor = np.round(float_image / scale + zero_point)
-                else:
-                    tensor = image
-                limits = np.iinfo(input_dtype)
-                tensor = np.clip(tensor, limits.min, limits.max).astype(input_dtype)
-
-            tensor = np.expand_dims(tensor, axis=0)
-            self.interpreter.set_tensor(self.input_details["index"], tensor)
+            self.interpreter.set_tensor(self.input_index, self.input_buffer)
             self.interpreter.invoke()
 
-            output = self.interpreter.get_tensor(self.output_details["index"])[0]
-            output = np.asarray(output, dtype=np.float32).reshape(-1)
+            output = self.interpreter.get_tensor(self.output_index)[0]
+            if output.dtype != np.float32 or output.ndim != 1:
+                output = np.asarray(output, dtype=np.float32).reshape(-1)
 
             out_scale, out_zero = self.output_details.get("quantization", (0.0, 0))
             if not np.issubdtype(self.output_details["dtype"], np.floating) and out_scale:
                 output = (output - out_zero) * out_scale
 
             # Some models already output probabilities; others output logits.
+            out_sum = float(np.sum(output))
             if (
                 np.any(output < 0)
                 or np.any(output > 1)
-                or not np.isclose(float(np.sum(output)), 1.0, atol=0.15)
+                or abs(out_sum - 1.0) > 0.15
             ):
                 probabilities = self._softmax(output)
             else:
-                probabilities = output / max(float(np.sum(output)), 1e-8)
+                probabilities = output / max(out_sum, 1e-8)
 
             best_index = int(np.argmax(probabilities))
             if best_index >= len(EMOTION_LABELS):
@@ -2567,14 +2912,15 @@ def smooth_emotion(face_key, emotion, confidence):
     if emotion is None or confidence is None:
         return None, None
 
-    emotion_history[face_key].append((emotion, confidence))
+    with state_lock:
+        emotion_history[face_key].append((emotion, confidence))
 
-    totals = defaultdict(float)
-    counts = defaultdict(int)
+        totals = defaultdict(float)
+        counts = defaultdict(int)
 
-    for label, score in emotion_history[face_key]:
-        totals[label] += float(score)
-        counts[label] += 1
+        for label, score in emotion_history[face_key]:
+            totals[label] += float(score)
+            counts[label] += 1
 
     best_label = max(totals, key=totals.get)
     average_confidence = totals[best_label] / max(1, counts[best_label])
@@ -2706,10 +3052,10 @@ def crop_person_box_with_padding(frame, x1, y1, x2, y2):
     h = box_height(y1, y2)
     pad = int(max(w, h) * FACE_CROP_PAD_FRAC)
 
-    left = clamp(int(x1) - pad, 0, frame_width - 1)
-    top = clamp(int(y1) - pad, 0, frame_height - 1)
-    right = clamp(int(x2) + pad, 0, frame_width - 1)
-    bottom = clamp(int(y2) + pad, 0, frame_height - 1)
+    left = clamp(int(x1) - pad, 0, frame_width)
+    top = clamp(int(y1) - pad, 0, frame_height)
+    right = clamp(int(x2) + pad, 0, frame_width)
+    bottom = clamp(int(y2) + pad, 0, frame_height)
 
     if right <= left or bottom <= top:
         return None
@@ -2718,22 +3064,23 @@ def crop_person_box_with_padding(frame, x1, y1, x2, y2):
 
 
 
-def detect_face_locations_for_emotion(crop_bgr):
+def detect_face_locations_for_emotion(crop_bgr, crop_rgb=None):
     """
-    Return face locations as (top, right, bottom, left).
+    Return (locations, crop_rgb, crop_gray) where locations are (top, right, bottom, left).
 
     First tries face_recognition/HOG when installed. If HOG misses the face,
     or face_recognition is not installed, it falls back to OpenCV Haar.
-    This lets emotion recognition work independently from identity recognition.
+    This lets emotion recognition work independently from identity recognition
+    while reusing RGB/grayscale conversions downstream.
     """
     locations = []
 
     if crop_bgr is None or crop_bgr.size == 0:
-        return locations
-
-    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        return locations, crop_rgb, None
 
     if face_recognition is not None:
+        if crop_rgb is None:
+            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
         try:
             locations = face_recognition.face_locations(
                 crop_rgb,
@@ -2745,12 +3092,12 @@ def detect_face_locations_for_emotion(crop_bgr):
             locations = []
 
     if locations:
-        return locations
-
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        return locations, crop_rgb, None
 
     if HAAR_FACE_CASCADE.empty():
-        return []
+        return [], crop_rgb, None
+
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
 
     faces = HAAR_FACE_CASCADE.detectMultiScale(
         gray,
@@ -2762,7 +3109,7 @@ def detect_face_locations_for_emotion(crop_bgr):
     for x, y, w, h in faces:
         locations.append((int(y), int(x + w), int(y + h), int(x)))
 
-    return locations
+    return locations, crop_rgb, gray
 
 
 def padded_face_crop(crop_bgr, location, padding_fraction=0.12):
@@ -2792,18 +3139,19 @@ def maybe_print_emotion(face_key, face_name, emotion, confidence):
         return
 
     now = time.time()
-    old = last_emotion_print.get(face_key)
+    with state_lock:
+        old = last_emotion_print.get(face_key)
 
-    changed = old is None or old["emotion"] != emotion
-    cooldown_passed = old is None or now - old["time"] >= EMOTION_PRINT_COOLDOWN_SECONDS
+        changed = old is None or old["emotion"] != emotion
+        cooldown_passed = old is None or now - old["time"] >= EMOTION_PRINT_COOLDOWN_SECONDS
 
-    if changed or cooldown_passed:
-        person_text = face_name or "person"
-        print(f"Expression: {person_text} looks {emotion} ({confidence:.0%})")
-        last_emotion_print[face_key] = {
-            "emotion": emotion,
-            "time": now,
-        }
+        if changed or cooldown_passed:
+            person_text = face_name or "person"
+            print(f"Expression: {person_text} looks {emotion} ({confidence:.0%})")
+            last_emotion_print[face_key] = {
+                "emotion": emotion,
+                "time": now,
+            }
 
 
 def emotion_speech_text(face_name, emotion):
@@ -2840,41 +3188,43 @@ def update_emotion_speech_candidate(face_key, face_name, emotion, confidence):
         return None
 
     now = time.time()
-    mem = emotion_speech_memory.setdefault(face_key, {
-        "candidate": None,
-        "stable_count": 0,
-        "last_spoken_emotion": None,
-        "last_spoken_time": 0.0,
-    })
+    with state_lock:
+        mem = emotion_speech_memory.setdefault(face_key, {
+            "candidate": None,
+            "stable_count": 0,
+            "last_spoken_emotion": None,
+            "last_spoken_time": 0.0,
+        })
 
-    if mem["candidate"] == emotion:
-        mem["stable_count"] += 1
-    else:
-        mem["candidate"] = emotion
-        mem["stable_count"] = 1
+        if mem["candidate"] == emotion:
+            mem["stable_count"] += 1
+        else:
+            mem["candidate"] = emotion
+            mem["stable_count"] = 1
 
-    if mem["stable_count"] < EMOTION_SPEAK_STABLE_READINGS:
-        return None
-
-    same_as_last = mem["last_spoken_emotion"] == emotion
-    elapsed = now - mem["last_spoken_time"]
-
-    if same_as_last and elapsed < EMOTION_SPEAK_COOLDOWN_SECONDS:
-        return None
-    if not same_as_last and mem["last_spoken_time"] > 0:
-        if elapsed < EMOTION_SPEAK_CHANGE_GAP_SECONDS:
+        if mem["stable_count"] < EMOTION_SPEAK_STABLE_READINGS:
             return None
+
+        same_as_last = mem["last_spoken_emotion"] == emotion
+        elapsed = now - mem["last_spoken_time"]
+
+        if same_as_last and elapsed < EMOTION_SPEAK_COOLDOWN_SECONDS:
+            return None
+        if not same_as_last and mem["last_spoken_time"] > 0:
+            if elapsed < EMOTION_SPEAK_CHANGE_GAP_SECONDS:
+                return None
 
     return emotion_speech_text(face_name, emotion)
 
 
 def commit_emotion_speech(face_key, emotion):
-    mem = emotion_speech_memory.get(face_key)
-    if mem is None:
-        return
+    with state_lock:
+        mem = emotion_speech_memory.get(face_key)
+        if mem is None:
+            return
 
-    mem["last_spoken_emotion"] = emotion
-    mem["last_spoken_time"] = time.time()
+        mem["last_spoken_emotion"] = emotion
+        mem["last_spoken_time"] = time.time()
 
 
 def recognize_face_in_person_box(frame_bgr, x1, y1, x2, y2, face_key, frame_count, detection_ran):
@@ -2902,7 +3252,10 @@ def recognize_face_in_person_box(frame_bgr, x1, y1, x2, y2, face_key, frame_coun
     if box_height(y1, y2) < FACE_MIN_PERSON_BOX_HEIGHT:
         return None, None, None, None
 
-    old = face_memory.get(face_key)
+    with state_lock:
+        old = face_memory.get(face_key)
+        if old is not None:
+            old = dict(old)
 
     # Identity and emotion have independent schedules. Using one shared minimum
     # interval would accidentally make identity run only when both modulos align.
@@ -2932,15 +3285,17 @@ def recognize_face_in_person_box(frame_bgr, x1, y1, x2, y2, face_key, frame_coun
         return None, None, None, None
 
     try:
-        face_locations = detect_face_locations_for_emotion(crop_bgr)
+        face_locations, crop_rgb, crop_gray = detect_face_locations_for_emotion(crop_bgr)
 
         if not face_locations:
             # Do not keep refreshing an old identity when the face is no longer
             # visible. This prevents a name or emotion from transferring to a
             # different person who later occupies the same area.
-            face_memory.pop(face_key, None)
-            emotion_history.pop(face_key, None)
-            last_emotion_print.pop(face_key, None)
+            with state_lock:
+                face_memory.pop(face_key, None)
+                emotion_history.pop(face_key, None)
+                last_emotion_print.pop(face_key, None)
+                emotion_speech_memory.pop(face_key, None)
             return None, None, None, None
 
         largest_location = max(
@@ -2957,7 +3312,8 @@ def recognize_face_in_person_box(frame_bgr, x1, y1, x2, y2, face_key, frame_coun
 
         # Identity is performed only when its own schedule is due.
         if identity_due:
-            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            if crop_rgb is None:
+                crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
             encodings = face_recognition.face_encodings(
                 crop_rgb,
                 known_face_locations=[largest_location],
@@ -2966,8 +3322,13 @@ def recognize_face_in_person_box(frame_bgr, x1, y1, x2, y2, face_key, frame_coun
             )
 
             if encodings:
+                ref_encodings = (
+                    known_face_encodings_matrix
+                    if known_face_encodings_matrix is not None
+                    else known_face_encodings
+                )
                 distances = face_recognition.face_distance(
-                    known_face_encodings,
+                    ref_encodings,
                     encodings[0],
                 )
 
@@ -2984,7 +3345,15 @@ def recognize_face_in_person_box(frame_bgr, x1, y1, x2, y2, face_key, frame_coun
         emotion_confidence = old.get("emotion_confidence") if old else None
 
         if emotion_due:
-            new_emotion, new_confidence = emotion_recognizer.predict(face_crop_bgr)
+            face_crop_gray = (
+                padded_face_crop(crop_gray, largest_location)
+                if crop_gray is not None
+                else None
+            )
+            new_emotion, new_confidence = emotion_recognizer.predict(
+                face_crop_bgr,
+                face_gray=face_crop_gray,
+            )
 
             if new_emotion is not None and new_confidence is not None:
                 emotion, emotion_confidence = smooth_emotion(
@@ -2993,13 +3362,14 @@ def recognize_face_in_person_box(frame_bgr, x1, y1, x2, y2, face_key, frame_coun
                     new_confidence,
                 )
 
-        face_memory[face_key] = {
-            "name": name,
-            "distance": best_distance,
-            "emotion": emotion,
-            "emotion_confidence": emotion_confidence,
-            "last_seen": time.time(),
-        }
+        with state_lock:
+            face_memory[face_key] = {
+                "name": name,
+                "distance": best_distance,
+                "emotion": emotion,
+                "emotion_confidence": emotion_confidence,
+                "last_seen": time.time(),
+            }
 
         return name, best_distance, emotion, emotion_confidence
 
@@ -3008,19 +3378,21 @@ def recognize_face_in_person_box(frame_bgr, x1, y1, x2, y2, face_key, frame_coun
         return None, None, None, None
 
 
-def cleanup_stale_face_memory():
-    now = time.time()
+def cleanup_stale_face_memory(now=None):
+    if now is None:
+        now = time.time()
 
-    stale_face_keys = [
-        key for key, mem in face_memory.items()
-        if now - mem["last_seen"] > TRACK_STALE_SECONDS
-    ]
+    with state_lock:
+        stale_face_keys = [
+            key for key, mem in face_memory.items()
+            if now - mem["last_seen"] > TRACK_STALE_SECONDS
+        ]
 
-    for key in stale_face_keys:
-        del face_memory[key]
-        emotion_history.pop(key, None)
-        last_emotion_print.pop(key, None)
-        emotion_speech_memory.pop(key, None)
+        for key in stale_face_keys:
+            del face_memory[key]
+            emotion_history.pop(key, None)
+            last_emotion_print.pop(key, None)
+            emotion_speech_memory.pop(key, None)
 
 
 
@@ -3066,14 +3438,23 @@ class LatestFrameSource:
         self.thread.start()
 
     def _capture_loop(self):
+        consecutive_failures = 0
         while self.running:
             ret, frame = self.source.read()
-            with self.condition:
-                if not ret or frame is None:
-                    self.failed = True
-                    self.running = False
-                    self.condition.notify_all()
+            if not ret or frame is None:
+                # One transient V4L2/Picamera2 hiccup should not end a long run;
+                # only give up after several consecutive failed reads.
+                consecutive_failures += 1
+                if consecutive_failures >= 5:
+                    with self.condition:
+                        self.failed = True
+                        self.running = False
+                        self.condition.notify_all()
                     return
+                time.sleep(0.05)
+                continue
+            consecutive_failures = 0
+            with self.condition:
                 self.latest_frame = frame
                 self.sequence += 1
                 self.condition.notify_all()
@@ -3181,6 +3562,10 @@ class Picamera2Source:
             self.picam2.stop()
         except Exception:
             pass
+        try:
+            self.picam2.close()
+        except Exception:
+            pass
 
 
 def open_source():
@@ -3272,18 +3657,72 @@ def run_yolo(model, frame):
     )
 
 
+def extract_detections(results, names):
+    """Convert YOLO Results into plain tuples once per detection frame.
+
+    The tensors are moved to numpy a single time here. Reuse frames (the two of
+    every three that do not run YOLO) iterate these tuples instead of re-slicing
+    torch tensors and rebuilding a Boxes object per box, and the heavy Results
+    object (which pins the detection frame) is released immediately.
+    """
+    if not results:
+        return []
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    classes = boxes.cls.cpu().numpy()
+    ids = boxes.id
+    ids = ids.cpu().numpy() if ids is not None else None
+
+    detections = []
+    for i in range(len(boxes)):
+        cls_id = int(classes[i])
+        x1, y1, x2, y2 = xyxy[i]
+        track_id = int(ids[i]) if ids is not None else -1
+        detections.append(
+            (names[cls_id], float(confs[i]), x1, y1, x2, y2, track_id)
+        )
+    return detections
+
+
+def load_detection_model():
+    """Load YOLO and fold BatchNorm into Conv2d for faster CPU inference.
+
+    fusion is in-place and numerically equivalent: same weights, same outputs,
+    fewer ops per frame. Non-PyTorch exports (e.g. the NCNN model named in
+    MODEL_NAME's comment) are already fused and reject fuse(), so skip them.
+    """
+    model = YOLO(MODEL_NAME)
+    try:
+        model.fuse(verbose=False)
+    except TypeError:
+        pass
+    return model
+
+
 def main():
-    global known_face_names, known_face_encodings, emotion_recognizer
+    global known_face_names, known_face_encodings, known_face_encodings_matrix
+    global emotion_recognizer, last_cleanup_time
 
     ensure_log_file()
     start_tof_worker()
 
     known_face_names, known_face_encodings = load_known_faces()
+    # Build the reference matrix once so face_distance() does not rebuild a
+    # (N, 128) array from the Python list on every identity inference.
+    known_face_encodings_matrix = (
+        np.asarray(known_face_encodings, dtype=np.float64)
+        if known_face_encodings
+        else None
+    )
     emotion_recognizer = EmotionRecognizer(EMOTION_MODEL_FILE)
 
     print("Loading YOLO model...")
     print(f"Model: {MODEL_NAME}")
-    model = YOLO(MODEL_NAME)
+    model = load_detection_model()
 
     print("Opening source...")
     source = open_source()
@@ -3319,7 +3758,7 @@ def main():
     print()
 
     frame_count = 0
-    last_results = None
+    last_detections = []
 
     prev_time = time.time()
     fps = 0.0
@@ -3350,13 +3789,13 @@ def main():
             if not detection_enabled:
                 # Keep the live camera/window running, but do zero object/hazard
                 # processing until the user says ON again.
-                results = None
-                last_results = None
+                detections = []
+                last_detections = []
             elif detection_ran:
-                results = run_yolo(model, frame)
-                last_results = results
+                detections = extract_detections(run_yolo(model, frame), model.names)
+                last_detections = detections
             else:
-                results = last_results
+                detections = last_detections
 
             best_risk = 0
             best_reason = ""
@@ -3369,197 +3808,199 @@ def main():
             emotion_speech_candidates = []
             nearest_matched_tof_m = float("inf")
 
+            # Take one ToF snapshot and overlap rectangle per frame and share
+            # them across the summary, overlay, every box, and the unknown
+            # obstacle check instead of re-locking and recomputing per box.
+            tof_snapshot = None
+            tof_overlap = None
+            if detection_enabled and ENABLE_TOF:
+                tof_snapshot = get_tof_snapshot()
+                tof_overlap = tof_overlap_rectangle(frame_width, frame_height)
+
             if detection_enabled:
-                maybe_print_tof_summary()
+                maybe_print_tof_summary(tof_snapshot)
 
             if SHOW_WINDOW:
                 draw_walking_corridor(frame)
                 if detection_enabled:
-                    draw_tof_overlay(frame)
+                    draw_tof_overlay(frame, snapshot=tof_snapshot, overlap=tof_overlap)
 
-            if results and len(results) > 0:
-                result = results[0]
+            if detections:
+                for class_name, conf, x1, y1, x2, y2, track_id in detections:
+                    cx, cy = center_of_box(x1, y1, x2, y2)
+                    area = box_area(x1, y1, x2, y2)
 
-                if result.boxes is not None:
-                    for box in result.boxes:
-                        cls_id = int(box.cls[0])
-                        class_name = model.names[cls_id]
-                        conf = float(box.conf[0])
+                    foot_y = y2
+                    in_corridor, corridor_position = corridor_geometry_for_point(
+                        cx, foot_y, frame_width, frame_height
+                    )
 
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        cx, cy = center_of_box(x1, y1, x2, y2)
-                        area = box_area(x1, y1, x2, y2)
+                    alert_key = make_alert_key(
+                        track_id=track_id,
+                        class_name=class_name,
+                        corridor_position=corridor_position,
+                    )
+                    distance_key = make_distance_key(
+                        track_id=track_id,
+                        class_name=class_name,
+                        corridor_position=corridor_position,
+                    )
 
-                        if box.id is not None:
-                            track_id = int(box.id[0])
-                        else:
-                            track_id = -1
+                    # Only update motion history on real detection frames and if tracking IDs exist.
+                    if detection_ran and track_id != -1:
+                        track_history[track_id].append({
+                            "time": time.time(),
+                            "cx": cx,
+                            "cy": cy,
+                            "area": area,
+                            "class_name": class_name,
+                        })
 
-                        foot_y = y2
-                        corridor_position = corridor_position_word(cx, foot_y, frame_width, frame_height)
+                    risk, reason, debug = score_risk(
+                        class_name=class_name,
+                        cx=cx,
+                        cy=cy,
+                        x1=x1,
+                        y1=y1,
+                        x2=x2,
+                        y2=y2,
+                        frame_width=frame_width,
+                        frame_height=frame_height,
+                        track_id=track_id,
+                        distance_key=distance_key,
+                        update_distance=detection_ran,
+                        in_corridor=in_corridor,
+                        corridor_position=corridor_position,
+                        tof_snapshot=tof_snapshot,
+                        tof_overlap=tof_overlap,
+                    )
 
-                        alert_key = make_alert_key(
-                            track_id=track_id,
-                            class_name=class_name,
-                            corridor_position=corridor_position,
+                    if debug.get("distance_source") == "tof" and debug.get("in_corridor"):
+                        nearest_matched_tof_m = min(
+                            nearest_matched_tof_m,
+                            debug.get("fake_distance_m", float("inf")),
                         )
-                        distance_key = make_distance_key(
+
+                    debug["face_name"] = None
+                    debug["face_distance_score"] = None
+                    debug["emotion"] = None
+                    debug["emotion_confidence"] = None
+
+                    if class_name == "person":
+                        face_key = make_face_key(
                             track_id=track_id,
-                            class_name=class_name,
-                            corridor_position=corridor_position,
-                        )
-
-                        # Only update motion history on real detection frames and if tracking IDs exist.
-                        if detection_ran and track_id != -1:
-                            track_history[track_id].append({
-                                "time": time.time(),
-                                "cx": cx,
-                                "cy": cy,
-                                "area": area,
-                                "class_name": class_name,
-                            })
-
-                        risk, reason, debug = score_risk(
                             class_name=class_name,
                             cx=cx,
                             cy=cy,
+                            frame_width=frame_width,
+                            frame_height=frame_height,
+                            corridor_position=corridor_position,
+                        )
+
+                        (
+                            face_name,
+                            face_distance_score,
+                            emotion,
+                            emotion_confidence,
+                        ) = recognize_face_in_person_box(
+                            frame_bgr=frame,
                             x1=x1,
                             y1=y1,
                             x2=x2,
                             y2=y2,
-                            frame_width=frame_width,
-                            frame_height=frame_height,
-                            track_id=track_id,
-                            distance_key=distance_key,
-                            update_distance=detection_ran,
+                            face_key=face_key,
+                            frame_count=frame_count,
+                            detection_ran=detection_ran,
                         )
 
-                        if debug.get("distance_source") == "tof" and debug.get("in_corridor"):
-                            nearest_matched_tof_m = min(
-                                nearest_matched_tof_m,
-                                debug.get("fake_distance_m", float("inf")),
-                            )
+                        if face_name:
+                            debug["face_name"] = face_name
+                            debug["face_distance_score"] = face_distance_score
 
-                        debug["face_name"] = None
-                        debug["face_distance_score"] = None
-                        debug["emotion"] = None
-                        debug["emotion_confidence"] = None
+                            # Make alerts friendlier:
+                            # "Caution. Alex close in path."
+                            if reason.startswith("person"):
+                                reason = reason.replace("person", face_name, 1)
 
-                        if class_name == "person":
-                            face_key = make_face_key(
-                                track_id=track_id,
-                                class_name=class_name,
-                                cx=cx,
-                                cy=cy,
-                                frame_width=frame_width,
-                                frame_height=frame_height,
-                                corridor_position=corridor_position,
-                            )
-
-                            (
-                                face_name,
-                                face_distance_score,
-                                emotion,
-                                emotion_confidence,
-                            ) = recognize_face_in_person_box(
-                                frame_bgr=frame,
-                                x1=x1,
-                                y1=y1,
-                                x2=x2,
-                                y2=y2,
+                        if emotion:
+                            debug["emotion"] = emotion
+                            debug["emotion_confidence"] = emotion_confidence
+                            maybe_print_emotion(
                                 face_key=face_key,
-                                frame_count=frame_count,
-                                detection_ran=detection_ran,
+                                face_name=face_name,
+                                emotion=emotion,
+                                confidence=emotion_confidence,
                             )
 
-                            if face_name:
-                                debug["face_name"] = face_name
-                                debug["face_distance_score"] = face_distance_score
+                            # Count only fresh inference frames toward
+                            # expression stability, not cached frames.
+                            fresh_emotion_frame = (
+                                detection_ran
+                                and frame_count % EMOTION_EVERY_N_FRAMES == 0
+                            )
+                            close_enough_for_emotion = (
+                                debug["fake_distance_m"]
+                                <= EMOTION_SPEAK_MAX_DISTANCE_M
+                            )
 
-                                # Make alerts friendlier:
-                                # "Caution. Alex close in path."
-                                if reason.startswith("person"):
-                                    reason = reason.replace("person", face_name, 1)
-
-                            if emotion:
-                                debug["emotion"] = emotion
-                                debug["emotion_confidence"] = emotion_confidence
-                                maybe_print_emotion(
+                            if fresh_emotion_frame and close_enough_for_emotion:
+                                emotion_message = update_emotion_speech_candidate(
                                     face_key=face_key,
                                     face_name=face_name,
                                     emotion=emotion,
                                     confidence=emotion_confidence,
                                 )
+                                if emotion_message:
+                                    emotion_speech_candidates.append({
+                                        "face_key": face_key,
+                                        "emotion": emotion,
+                                        "confidence": emotion_confidence,
+                                        "message": emotion_message,
+                                    })
 
-                                # Count only fresh inference frames toward
-                                # expression stability, not cached frames.
-                                fresh_emotion_frame = (
-                                    detection_ran
-                                    and frame_count % EMOTION_EVERY_N_FRAMES == 0
-                                )
-                                close_enough_for_emotion = (
-                                    debug["fake_distance_m"]
-                                    <= EMOTION_SPEAK_MAX_DISTANCE_M
-                                )
+                    update_object_memory(alert_key, risk, reason)
 
-                                if fresh_emotion_frame and close_enough_for_emotion:
-                                    emotion_message = update_emotion_speech_candidate(
-                                        face_key=face_key,
-                                        face_name=face_name,
-                                        emotion=emotion,
-                                        confidence=emotion_confidence,
-                                    )
-                                    if emotion_message:
-                                        emotion_speech_candidates.append({
-                                            "face_key": face_key,
-                                            "emotion": emotion,
-                                            "confidence": emotion_confidence,
-                                            "message": emotion_message,
-                                        })
+                    if LOG_ALL_DETECTIONS and detection_ran:
+                        log_row(
+                            event="detection",
+                            class_name=class_name,
+                            confidence=conf,
+                            risk=risk,
+                            reason=reason,
+                            debug=debug,
+                            track_id=track_id,
+                        )
 
-                        update_object_memory(alert_key, risk, reason)
+                    if (
+                        risk > best_risk
+                        or (risk == best_risk and risk > 0 and debug["fake_distance_m"] < best_distance_m)
+                    ):
+                        best_risk = risk
+                        best_reason = reason
+                        best_alert_key = alert_key
+                        best_debug = debug
+                        best_class_name = class_name
+                        best_conf = conf
+                        best_track_id = track_id
+                        best_distance_m = debug["fake_distance_m"]
 
-                        if LOG_ALL_DETECTIONS and detection_ran:
-                            log_row(
-                                event="detection",
-                                class_name=class_name,
-                                confidence=conf,
-                                risk=risk,
-                                reason=reason,
-                                debug=debug,
-                                track_id=track_id,
-                            )
-
-                        if (
-                            risk > best_risk
-                            or (risk == best_risk and risk > 0 and debug["fake_distance_m"] < best_distance_m)
-                        ):
-                            best_risk = risk
-                            best_reason = reason
-                            best_alert_key = alert_key
-                            best_debug = debug
-                            best_class_name = class_name
-                            best_conf = conf
-                            best_track_id = track_id
-                            best_distance_m = debug["fake_distance_m"]
-
-                        if SHOW_WINDOW:
-                            draw_object_box(
-                                frame=frame,
-                                x1=x1,
-                                y1=y1,
-                                x2=x2,
-                                y2=y2,
-                                class_name=class_name,
-                                conf=conf,
-                                risk=risk,
-                                track_id=track_id,
-                                debug=debug,
-                            )
+                    if SHOW_WINDOW:
+                        draw_object_box(
+                            frame=frame,
+                            x1=x1,
+                            y1=y1,
+                            x2=x2,
+                            y2=y2,
+                            class_name=class_name,
+                            conf=conf,
+                            risk=risk,
+                            track_id=track_id,
+                            debug=debug,
+                        )
 
             # If real depth reports a close central obstacle but YOLO cannot
             # associate it with a recognized object, warn generically.
-            unknown_tof = tof_unknown_path_distance() if detection_enabled else None
+            unknown_tof = tof_unknown_path_distance(tof_snapshot) if detection_enabled else None
             if unknown_tof is not None:
                 unknown_distance = unknown_tof["distance_m"]
                 unknown_is_separate = (
@@ -3607,8 +4048,12 @@ def main():
                         best_track_id = -1
                         best_distance_m = unknown_distance
 
-            cleanup_stale_memory()
-            cleanup_stale_face_memory()
+            # Sweep stale state on the existing interval instead of scanning every
+            # dict under the lock on every camera frame.
+            if now - last_cleanup_time >= CLEANUP_INTERVAL_SECONDS:
+                last_cleanup_time = now
+                cleanup_stale_memory(now)
+                cleanup_stale_face_memory(now)
 
             safety_message_queued = False
 
@@ -3676,6 +4121,7 @@ def main():
         stop_voice_control()
         stop_tof_worker()
         stop_speech_worker()
+        close_log_file()
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
 
