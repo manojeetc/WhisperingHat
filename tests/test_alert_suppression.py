@@ -149,3 +149,168 @@ def test_generic_alert_keeps_known_object_behavior(new, monkeypatch):
     new.last_global_alert_time = 0.0
     _set_time(monkeypatch, 1000.8)
     assert new.should_alert(key, 1, "person right in path") is True
+
+
+def test_only_changed_stop_is_urgent(new):
+    # A new, escalated, or materially closer STOP interrupts a reading.
+    assert new.safety_alert_is_urgent(3, {"new": True}) is True
+    assert new.safety_alert_is_urgent(3, {"escalated": True}) is True
+    assert new.safety_alert_is_urgent(3, {"materially_closer": True}) is True
+    # An unchanged repeat of the same stationary STOP queues normally.
+    assert new.safety_alert_is_urgent(
+        3, {"new": False, "escalated": False,
+            "materially_closer": False, "repeat": True}
+    ) is False
+    assert new.safety_alert_is_urgent(3, {}) is False
+    assert new.safety_alert_is_urgent(2, {"new": True}) is False
+    assert new.safety_alert_is_urgent(1, {"escalated": True}) is False
+
+
+def test_queued_repeat_is_dropped_when_hazard_is_stale_or_gone(new):
+    reset_state(new)
+    mem = new.update_object_memory(UNKNOWN_KEY, 3, STOP, distance_m=0.3)
+    now = mem["last_seen"]
+
+    assert new.hazard_still_present(
+        UNKNOWN_KEY, 3, now=now + 0.5
+    ) is True
+    assert new.hazard_still_present(
+        UNKNOWN_KEY, 3, now=now + 5.0
+    ) is False
+    assert new.hazard_still_present(
+        UNKNOWN_KEY, 2, now=now + 0.5
+    ) is True
+    # A queued STOP must not speak after the current risk has dropped to caution.
+    new.update_object_memory(UNKNOWN_KEY, 2, CAUTION, distance_m=1.0)
+    assert new.hazard_still_present(
+        UNKNOWN_KEY, 3, now=now + 0.5
+    ) is False
+
+
+def test_force_interrupt_stops_protected_playback(new, monkeypatch):
+    class FakeProc:
+        terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    process = FakeProc()
+    monkeypatch.setattr(new, "current_audio_process", process)
+    monkeypatch.setattr(new, "current_audio_protected", True)
+
+    new.interrupt_current_speech(force=True)
+    assert process.terminated is True
+
+
+def test_stationary_stop_repeat_queues_but_closer_stop_interrupts(new, monkeypatch):
+    reset_state(new)
+    interrupts = []
+    monkeypatch.setattr(new, "start_speech_worker", lambda: None)
+    monkeypatch.setattr(
+        new,
+        "interrupt_current_speech",
+        lambda force=False: interrupts.append(force),
+    )
+
+    _set_time(monkeypatch, 1000.0)
+    new.update_object_memory(UNKNOWN_KEY, 3, STOP, distance_m=0.8)
+    assert new.should_alert(UNKNOWN_KEY, 3, STOP, distance_m=0.8) is False
+    _set_time(monkeypatch, 1000.2)
+    assert new.should_alert(UNKNOWN_KEY, 3, STOP, distance_m=0.8) is True
+    assert new.safety_alert_is_urgent(3, new.last_alert_decision) is True
+
+    # Unchanged stationary repeat: no interrupt, normal queue entry.
+    _set_time(monkeypatch, 1031.0)
+    new.update_object_memory(UNKNOWN_KEY, 3, STOP, distance_m=0.8)
+    assert new.should_alert(UNKNOWN_KEY, 3, STOP, distance_m=0.8) is True
+    assert new.last_alert_decision["repeat"] is True
+    assert new.safety_alert_is_urgent(3, new.last_alert_decision) is False
+    assert new.play_alert_sound(
+        3, STOP, urgent=False, alert_key=UNKNOWN_KEY, alert_repeat=True
+    )
+    assert interrupts == []
+
+    # Same hazard, now materially closer: urgent interrupt.
+    _set_time(monkeypatch, 1031.5)
+    new.update_object_memory(UNKNOWN_KEY, 3, STOP, distance_m=0.2)
+    assert new.should_alert(UNKNOWN_KEY, 3, STOP, distance_m=0.2) is True
+    assert new.last_alert_decision["materially_closer"] is True
+    assert new.safety_alert_is_urgent(3, new.last_alert_decision) is True
+    assert new.play_alert_sound(3, STOP, urgent=True)
+    assert interrupts == [True]
+
+
+def test_unchanged_stop_queues_without_interrupting(new, monkeypatch):
+    reset_state(new)
+    calls = []
+    monkeypatch.setattr(new, "start_speech_worker", lambda: None)
+    monkeypatch.setattr(
+        new,
+        "interrupt_current_speech",
+        lambda force=False: calls.append(force),
+    )
+
+    assert new.play_alert_sound(
+        3,
+        "STOP. obstacle very close.",
+        urgent=False,
+        alert_key=UNKNOWN_KEY,
+        alert_repeat=True,
+    )
+    assert calls == []
+
+    item = new.speech_queue.get_nowait()
+    new.speech_queue.task_done()
+    assert item[0] == -3
+    assert item[2] == "STOP. obstacle very close."
+    assert item[7] == 3
+    assert item[9] is True
+
+
+def test_speech_worker_rechecks_repeat_presence(new, monkeypatch):
+    reset_state(new)
+    spoken = []
+    monkeypatch.setattr(
+        new, "_speak_message_now",
+        lambda message, origin_perf, origin_label: spoken.append(message),
+    )
+
+    # No track_memory entry: the queued repeat must be dropped.
+    new.speech_queue.put_nowait((
+        -3, 1, STOP, True, None, "hazard",
+        UNKNOWN_KEY, 3, 0.3, True,
+    ))
+    new.speech_queue.put_nowait((999, 2, None, False, None, None))
+    new._speech_worker()
+    assert spoken == []
+
+    # Fresh memory at the same risk: the repeat may speak.
+    new.update_object_memory(UNKNOWN_KEY, 3, STOP, distance_m=0.3)
+    new.speech_queue.put_nowait((
+        -3, 3, STOP, True, None, "hazard",
+        UNKNOWN_KEY, 3, 0.3, True,
+    ))
+    new.speech_queue.put_nowait((999, 4, None, False, None, None))
+    new._speech_worker()
+    assert spoken == [STOP]
+
+
+def test_urgent_play_calls_force_interrupt(new, monkeypatch):
+    reset_state(new)
+    calls = {}
+    monkeypatch.setattr(new, "start_speech_worker", lambda: None)
+    monkeypatch.setattr(
+        new,
+        "interrupt_current_speech",
+        lambda force=False: calls.update(force=force),
+    )
+
+    assert new.play_alert_sound(3, "STOP. obstacle very close.", urgent=True)
+    assert calls["force"] is True
+
+    while not new.speech_queue.empty():
+        new.speech_queue.get_nowait()
+        new.speech_queue.task_done()

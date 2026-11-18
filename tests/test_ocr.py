@@ -26,6 +26,11 @@ def _frame():
     return np.zeros((8, 8, 3), dtype=np.uint8)
 
 
+def _ocr_result(new, text, conf=90.0):
+    words = [(word, conf) for word in text.split()]
+    return text, words, new._ocr_text_metrics(text, words)
+
+
 # --- text cleaning --------------------------------------------------------
 def test_clean_ocr_text_collapses_whitespace(new):
     assert new._clean_ocr_text("  HELLO   world\n\nthis is\t a sign  \n") == \
@@ -121,7 +126,43 @@ def test_peek_latest_none_when_no_frame(new):
     assert src.peek_latest() is None
 
 
-def test_grab_ocr_frame_prefers_peek(new):
+def test_grab_ocr_frame_prefers_still_when_opted_in(new, monkeypatch):
+    monkeypatch.setattr(new, "OCR_USE_STILL", True)
+
+    class FakeSource:
+        def capture_still(self):
+            return "STILL"
+
+        def peek_latest(self):
+            return "PEEKED"
+
+        def read(self):
+            return True, "READ"
+
+    assert new._grab_ocr_frame(FakeSource()) == "STILL"
+
+
+def test_grab_ocr_frame_skips_still_by_default(new, monkeypatch):
+    monkeypatch.setattr(new, "OCR_USE_STILL", False)
+    calls = []
+
+    class FakeSource:
+        def capture_still(self):
+            calls.append("still")
+            return "STILL"
+
+        def peek_latest(self):
+            return "PEEKED"
+
+        def read(self):
+            return True, "READ"
+
+    assert new._grab_ocr_frame(FakeSource()) == "PEEKED"
+    assert calls == []
+
+
+def test_grab_ocr_frame_prefers_peek_without_still(new, monkeypatch):
+    monkeypatch.setattr(new, "OCR_USE_STILL", False)
     class FakeSource:
         def peek_latest(self):
             return "PEEKED"
@@ -130,6 +171,40 @@ def test_grab_ocr_frame_prefers_peek(new):
             return True, "READ"
 
     assert new._grab_ocr_frame(FakeSource()) == "PEEKED"
+
+
+def test_latest_frame_measures_high_res_still_gap(new):
+    src = object.__new__(new.LatestFrameSource)
+    src.condition = threading.Condition()
+    src.sequence = 0
+    src.latest_frame = None
+    src.last_frame_monotonic = 10.0
+    src.still_capture_started_monotonic = 10.0
+    src.still_capture_active = True
+    src.last_still_gap_s = None
+    src.max_still_gap_s = 0.0
+
+    # A frame arriving during the still window records the live gap.
+    src._note_detection_frame("during", 12.0)
+    assert src.max_still_gap_s == pytest.approx(2.0)
+    assert src.still_capture_started_monotonic == pytest.approx(10.0)
+
+    # The first frame after the still closes the full blind window.
+    src.still_capture_active = False
+    src._note_detection_frame("after", 13.0)
+    assert src.last_still_gap_s == pytest.approx(3.0)
+    assert src.max_still_gap_s == pytest.approx(3.0)
+    assert src.still_capture_started_monotonic is None
+
+
+def test_prepare_ocr_frame_resizes_without_upscaling(new, monkeypatch):
+    monkeypatch.setattr(new, "OCR_MAX_WIDTH", 1280)
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    prepared = new._prepare_ocr_frame(frame)
+    assert prepared.shape == (720, 1280, 3)
+
+    small = np.zeros((480, 640, 3), dtype=np.uint8)
+    assert new._prepare_ocr_frame(small).shape == (480, 640, 3)
 
 
 def test_grab_ocr_frame_falls_back_to_read(new):
@@ -149,7 +224,10 @@ def test_perform_ocr_read_speaks_text(new, monkeypatch):
     spoken = _capture_speech(new, monkeypatch)
     monkeypatch.setattr(new, "_ocr_available", lambda: True)
     monkeypatch.setattr(new, "_grab_ocr_frame", lambda s: _frame())
-    monkeypatch.setattr(new, "_run_tesseract", lambda f: "EXIT\n  only  ")
+    monkeypatch.setattr(
+        new, "_run_tesseract_tsv",
+        lambda f: _ocr_result(new, "EXIT\n  only  "),
+    )
     new._perform_ocr_read(object())
     assert spoken == [(2, "EXIT only")]
 
@@ -158,9 +236,72 @@ def test_perform_ocr_read_no_text(new, monkeypatch):
     spoken = _capture_speech(new, monkeypatch)
     monkeypatch.setattr(new, "_ocr_available", lambda: True)
     monkeypatch.setattr(new, "_grab_ocr_frame", lambda s: _frame())
-    monkeypatch.setattr(new, "_run_tesseract", lambda f: "   \n ")
+    monkeypatch.setattr(
+        new, "_run_tesseract_tsv",
+        lambda f: ("", [], new._ocr_text_metrics("", [])),
+    )
     new._perform_ocr_read(object())
     assert spoken == [(2, "I don't see any text.")]
+
+
+def test_perform_ocr_read_rejects_gibberish(new, monkeypatch):
+    spoken = _capture_speech(new, monkeypatch)
+    monkeypatch.setattr(new, "_ocr_available", lambda: True)
+    monkeypatch.setattr(new, "_grab_ocr_frame", lambda s: _frame())
+    gibberish = "borotndd ood baal rrordve polvion sual inna bith"
+    monkeypatch.setattr(
+        new, "_run_tesseract_tsv",
+        lambda f: _ocr_result(new, gibberish, conf=8.0),
+    )
+    new._perform_ocr_read(object())
+    assert spoken == [(
+        2,
+        "I couldn't read the page. Hold it steady and try again.",
+    )]
+
+    # The rejected raw text must never be queued.
+    assert all(gibberish not in message for _risk, message in spoken)
+
+
+def test_perform_ocr_read_queues_short_chunks(new, monkeypatch):
+    spoken = _capture_speech(new, monkeypatch)
+    monkeypatch.setattr(new, "_ocr_available", lambda: True)
+    monkeypatch.setattr(new, "_grab_ocr_frame", lambda s: _frame())
+    text = (
+        "The quick brown fox jumps over the lazy dog. " * 8
+        + "This is the second part of the page. " * 8
+    )
+    monkeypatch.setattr(
+        new, "_run_tesseract_tsv",
+        lambda f: _ocr_result(new, text, conf=95.0),
+    )
+    new._perform_ocr_read(object())
+
+    assert len(spoken) >= 2
+    assert all(len(message) <= new.OCR_SPEECH_CHUNK_CHARS for _risk, message in spoken)
+    assert len(spoken[0][1]) <= new.OCR_SPEECH_CHUNK_CHARS
+
+
+def test_ocr_later_chunks_yield_to_routine_repeats(new, monkeypatch):
+    calls = []
+
+    def fake_direct(message, **kwargs):
+        calls.append((message, kwargs.get("priority")))
+        return True
+
+    monkeypatch.setattr(new, "_ocr_available", lambda: True)
+    monkeypatch.setattr(new, "_grab_ocr_frame", lambda s: _frame())
+    monkeypatch.setattr(new, "_play_direct_response", fake_direct)
+    text = "A sentence with enough words to read. " * 12
+    monkeypatch.setattr(
+        new, "_run_tesseract_tsv",
+        lambda f: _ocr_result(new, text, conf=95.0),
+    )
+    new._perform_ocr_read(object())
+
+    assert len(calls) >= 2
+    assert calls[0][1] is None                 # first chunk keeps risk-2 priority
+    assert all(priority == 0 for _message, priority in calls[1:])
 
 
 def test_perform_ocr_read_unavailable(new, monkeypatch):
@@ -178,7 +319,7 @@ def test_perform_ocr_read_failure(new, monkeypatch):
     def boom(f):
         raise RuntimeError("tesseract died")
 
-    monkeypatch.setattr(new, "_run_tesseract", boom)
+    monkeypatch.setattr(new, "_run_tesseract_tsv", boom)
     new._perform_ocr_read(object())
     assert spoken == [(2, "I couldn't read that.")]
 
@@ -242,6 +383,44 @@ def test_run_tesseract_timeout_kills(new, monkeypatch):
     with pytest.raises(subprocess.TimeoutExpired):
         new._run_tesseract(_frame())
     assert killed.get("yes")
+
+
+def test_parse_tesseract_tsv_and_quality_metrics(new):
+    tsv = (
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\t"
+        "left\ttop\twidth\theight\tconf\ttext\n"
+        "5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t92\tHello\n"
+        "5\t1\t1\t1\t1\t2\t12\t0\t20\t10\t88\tworld\n"
+        "5\t1\t1\t1\t2\t1\t0\t20\t10\t10\t85\tSecond\n"
+    )
+    text, words, metrics = new._parse_tesseract_tsv(tsv)
+    assert text == "Hello world\nSecond"
+    assert words == [("Hello", 92.0), ("world", 88.0), ("Second", 85.0)]
+    assert metrics["word_count"] == 3
+    assert metrics["mean_conf"] == pytest.approx(88.33333333333333)
+    assert new._ocr_quality_ok(metrics) is True
+
+    gibberish = "borotndd ood baal rrordve"
+    _text, gibberish_words, bad_metrics = new._parse_tesseract_tsv(
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\t"
+        "left\ttop\twidth\theight\tconf\ttext\n"
+        + "\n".join(
+            f"5\t1\t1\t1\t1\t{i}\t0\t0\t10\t10\t8\t{word}"
+            for i, word in enumerate(gibberish.split(), start=1)
+        )
+        + "\n"
+    )
+    assert bad_metrics["word_count"] == 4
+    assert new._ocr_quality_ok(bad_metrics) is False
+
+
+def test_split_ocr_speech_chunks_short_first_chunk(new):
+    text = "A sentence with enough words to read. " * 12
+    chunks = new._split_ocr_speech_chunks(text)
+    assert chunks
+    assert len(chunks[0]) <= new.OCR_SPEECH_CHUNK_CHARS
+    assert len(chunks) <= new.OCR_MAX_SPEECH_CHUNKS
+    assert all(len(chunk) <= new.OCR_SPEECH_CHUNK_CHARS for chunk in chunks)
 
 
 def test_run_tesseract_nonzero_raises(new, monkeypatch):
@@ -309,3 +488,50 @@ def test_stop_ocr_reader_kills_running_process(new, monkeypatch):
     new.stop_ocr_reader()
     assert killed.get("yes")
     assert new.ocr_stop_event.is_set()
+
+def test_quality_rejects_high_confidence_gibberish(new):
+    # Even if Tesseract is confident, a long block without normal English
+    # function words is not safe to read aloud.
+    sample = (
+        "nae a bw borotndd ood baal orl rrordve polvion sual inna bith "
+        "ovorl myot olde anve ont soni snd l Hon ton tiolqxo ow yin outnee "
+        "aid oro cn aan gril orld iw Avotnirss Mi onlt oval int I boiwoqqn "
+        "oburoblit orld divovwl tion a ai of yor We ga H ban ov qa qu Ho DO "
+        "fy yosibntsiod ol wil Hyun Bay tte AO Oe wal ss gals ofl cw bern ff "
+        "st giqiotnno wl y oh ek vod a volo cu onltl Aout hors oolov i banda "
+        "aan OF AH aot bas aid oF pant Hohn unageb auoivord aidiag ol of "
+        "matt inbawal vow od ban bodonay es naw oqo of AEB i ions omit wid "
+        "dud v0 Awe od ninga bas"
+    )
+    _text, words, metrics = _ocr_result(new, sample, conf=95.0)
+    assert metrics["common_word_ratio"] < new.OCR_QUALITY_MIN_COMMON_WORD_RATIO
+    assert new._ocr_quality_ok(metrics) is False
+
+
+def test_run_tesseract_tsv_requests_tsv_config(new, monkeypatch):
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            return (
+                b"level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\t"
+                b"left\ttop\twidth\theight\tconf\ttext\n"
+                b"5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t90\tHello\n",
+                b"",
+            )
+
+        def kill(self):
+            pass
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(new.subprocess, "Popen", fake_popen)
+    text, words, metrics = new._run_tesseract_tsv(_frame())
+    assert captured["cmd"][-1] == "tsv"
+    assert text == "Hello"
+    assert words == [("Hello", 90.0)]
+    assert metrics["word_count"] == 1

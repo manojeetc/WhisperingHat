@@ -398,23 +398,42 @@ def _benchmark_ocr(hat, image_paths, loops):
     if not hat._ocr_available():
         return {"available": False, "reason": "tesseract binary not on PATH"}
     samples = []
+    accepted = 0
+    rejected = 0
+    word_counts = []
+    confidences = []
+    last_text = ""
     for _ in range(max(1, loops)):
         for image_path in image_paths:
             frame = _load_image(image_path)
             started = time.perf_counter()
             try:
-                text = hat._run_tesseract(frame)
+                text, _words, metrics = hat._run_tesseract_tsv(frame)
+                quality_ok = hat._ocr_quality_ok(metrics)
                 error = None
             except Exception as exc:
                 text = ""
+                metrics = {}
+                quality_ok = False
                 error = f"{type(exc).__name__}: {exc}"
             samples.append((time.perf_counter() - started) * 1000.0)
             if error:
                 return {"available": True, "error": error, "latency": _latency_stats(samples)}
+            last_text = text
+            accepted += int(bool(quality_ok))
+            rejected += int(not quality_ok)
+            word_counts.append(int(metrics.get("word_count", 0)))
+            confidences.append(float(metrics.get("mean_conf", 0.0)))
     return {
         "available": True,
         "latency": _latency_stats(samples),
-        "last_text_chars": len(text),
+        "accepted_pages": accepted,
+        "rejected_pages": rejected,
+        "acceptance_rate": round(accepted / max(1, accepted + rejected), 3),
+        "mean_words": round(statistics.mean(word_counts), 1) if word_counts else 0,
+        "mean_confidence": round(statistics.mean(confidences), 1) if confidences else 0,
+        "last_text_chars": len(last_text),
+        "note": "Quality gate is applied to each page; rejected means the app would speak the retry instruction.",
     }
 
 

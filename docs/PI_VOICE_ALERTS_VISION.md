@@ -139,8 +139,9 @@ A second concrete failure path was found in the speech queue:
 `interrupt_current_speech()` on **every** STOP, including repeated STOPs.
 An OCR answer is queued at risk 2. A repeated STOP could therefore clear the
 answer the user just requested, which looks exactly like “read this did not
-trigger anything.” Routine repeated alerts no longer clear a direct command
-response; a genuinely new/escalated STOP can still interrupt for safety.
+trigger anything.” Urgency is now change-based: a new, escalated, or materially
+closer STOP interrupts; an unchanged repeat queues, is rechecked for presence,
+and can speak between OCR chunks.
 
 What changed:
 
@@ -230,6 +231,67 @@ the `[voice status]` line should identify the exact stage that stops. Do not
 conclude that TTS feedback is the cause until the log shows
 `vosk_result final="" tts_overlap=True`; if it does, compare audible vs.
 physically muted speaker while software playback still runs.
+
+### 1.5 OCR garbage, long playback, and urgent STOP
+
+The Pi log confirms the OCR failure mode:
+
+- `ocr_frame frame_shape=(480, 640, 3)` — Tesseract ran on the detection frame.
+- `raw_chars=996 chars=600 elapsed_s=6.395` — a long block of low-quality text
+  was cleaned and queued at caution priority.
+- `duration_s=20.025` — that block hit the 20 s playback timeout.
+- `hazard_to_tts_start=6056.9ms` — a risk-3 STOP waited behind the reading.
+
+What changed:
+
+- `_run_tesseract_tsv()` requests Tesseract TSV output so the app gets per-word
+  confidence, text boxes, and word counts.
+- `_ocr_quality_ok()` rejects results when confidence or language-likeness is
+  weak: mean/good-word confidence, alphabetic ratio, vowel-bearing words,
+  long consonant runs, and (for longer blocks) a minimum fraction of common
+  English function words. A rejected result speaks only:
+  `I couldn't read the page. Hold it steady and try again.`
+- `_grab_ocr_frame()` can ask the camera for a one-off high-resolution still
+  (`OCR_USE_STILL`). It is **opt-in and off by default** because the still-mode
+  switch has not yet been measured on the Pi. The detection stream remains at
+  `CAMERA_WIDTH x CAMERA_HEIGHT`; only the OCR request switches modes briefly.
+  The still is downscaled to `OCR_MAX_WIDTH` before Tesseract. Defaults are
+  1920x1440 still, 1024-pixel OCR width, and a 20 s OCR subprocess timeout;
+  all are environment-overridable. Enable it for the A/B test with
+  `WHISPER_HAT_OCR_STILL=1`.
+- `LatestFrameSource` records the gap from the last fresh detection frame to
+  the first frame after a still capture and logs
+  `[camera] high-res still frame gap=... max=....` Detection and obstacle
+  alerts cannot update while no fresh frame exists, so that line is the direct
+  measure of the alert blind window. The main loop waits through the still
+  instead of treating the pause as a dead camera.
+- `ocr_frame` now logs `frame_origin=still|peek|read`, original/OCR frame
+  shapes, blur score, brightness, contrast, and text-box placement.
+- `ocr_tesseract_done` logs `quality_ok`, word count, mean confidence,
+  good-word ratio, alpha/vowel/long-consonant/common-word ratios, text box, and
+  elapsed time.
+- Readable text is split into up to `OCR_MAX_SPEECH_CHUNKS` chunks of about
+  `OCR_SPEECH_CHUNK_CHARS` characters. The first chunk is queued first, so a
+  single playback cannot hold the worker for 20 s. `ocr_first_chunk_queued`
+  records the time to useful speech.
+- STOP urgency is change-based. A new, escalated, or materially closer STOP
+  calls `interrupt_current_speech(force=True)` immediately. An unchanged
+  repeat of the same STOP queues normally, so a stationary book does not keep
+  cutting off its own reading. Later OCR chunks have lower queue priority than
+  routine notices/cautions, so a repeat can speak between chunks.
+- Queued repeats are rechecked at dequeue time with `hazard_still_present()`.
+  If the hazard has not been refreshed within 1.5 s, or its current risk has
+  dropped below the queued risk, the repeat is dropped and logged as
+  `speech_repeat_dropped reason=hazard_not_present`.
+
+The listener stall log is consistent with a blocked native capture read, not
+an ALSA error causing it: the watchdog reported no progress for 12.5 s at
+`stage=listening`, closed the stream, and only then did ALSA report
+`alsa_snd_pcm_mmap_begin` / `Unanticipated host error`. The stream reopened and
+the mic recalibrated. The next run adds `listen_wait phrase_limit_s=4.0
+stream_active=...` and `listen_return` so a blocked read can be separated from
+a Vosk/CPU stall. Treat the ALSA lines as a consequence of closing a stuck
+stream unless a `listen_wait`/`listen_return` pair shows otherwise.
 
 ## 2. Published vision benchmarks vs. our device
 
@@ -600,9 +662,10 @@ python tests/bench_pi.py \
 ```
 
 The JSON records model size, detection median/p95/FPS, detection counts,
-optional mAP, OCR median/p95, TTS wall time, peak RSS, and `vcgencmd`
-temperature/`get_throttled` before and after combined load. Run it on battery
-or with the official 5 A supply and the active cooler; record the power mode.
+optional mAP, OCR median/p95 and quality acceptance counts, TTS wall time,
+peak RSS, and `vcgencmd` temperature/`get_throttled` before and after combined
+load. Run it on battery or with the official 5 A supply and the active cooler;
+record the power mode.
 
 For end-to-end hazard/command latencies, the app logs:
 
@@ -664,6 +727,71 @@ whether the object was visible in the camera frame. Run YOLO11n, YOLO11s, and
 one YOLOE candidate on the same frames and conditions. Do not call the dropout
 fixed, or the vocabulary upgrade successful, until these Pi logs exist.
 
+### 3.7 OCR quality and interruption test
+
+Use a real book page, not a synthetic screenshot. Run with the detection stream
+unchanged and test both preview-frame OCR and the high-resolution still:
+
+```bash
+# A: preview frame only (A/B baseline)
+WHISPER_HAT_OCR_STILL=0 WHISPER_HAT_VOICE_DEBUG=1 WHISPER_HAT_LATENCY_DEBUG=1 \
+  .venv/bin/python -u whisper.py 2>&1 | tee /tmp/whisper-ocr-preview.log
+
+# B: one high-resolution still per "read this"
+WHISPER_HAT_OCR_STILL=1 WHISPER_HAT_VOICE_DEBUG=1 WHISPER_HAT_LATENCY_DEBUG=1 \
+  .venv/bin/python -u whisper.py 2>&1 | tee /tmp/whisper-ocr-still.log
+```
+
+Keep the **same upright, well-lit page at the same distance** for the first A/B
+comparison so resolution is the only variable. Fill most of the frame with
+text, hold the page flat, and keep the camera level. Record the printed text
+first, then compare what the hat actually reads against it; `quality_ok=True`
+alone is not a pass. Then repeat at about 0.5 m, 0.8 m, and 1.2 m. Try rotated
+pages separately (90 and 180 degrees) after the upright comparison, so
+orientation does not confound the resolution result. Do not change
+preprocessing thresholds until focus/framing is ruled out. To see the raw
+behavior without the gate for one diagnostic run, set
+`WHISPER_HAT_OCR_QUALITY=0`; never use that setting for normal use.
+
+Read these fields from each `read this` attempt:
+
+| Field | What it tells you |
+|---|---|
+| `ocr_frame frame_origin=still/peek` | Whether the high-resolution still path worked. |
+| `original_shape` / `ocr_shape` | Capture resolution and the actual Tesseract input. |
+| `blur_score` / `brightness` / `contrast` | Focus and exposure before blaming Tesseract. |
+| `ocr_tesseract_done quality_ok` | Whether the garbage gate accepted the page. |
+| `mean_conf`, `common_word_ratio`, `text_box` | Why the gate accepted/rejected, and whether text fills the frame. |
+| `ocr_first_chunk_queued elapsed_s` | Time from command to first speakable chunk being queued. |
+| `command_to_tts_start` | Time from command to the first OCR audio actually starting. |
+| `ocr_quality_rejected` | Rejected garbage; the spoken fallback should follow. |
+| `[camera] high-res still frame gap` | Longest gap between fresh detection frames and the alert blind window during a still. |
+| `speech_repeat_dropped` | Queued repeat skipped because the hazard was stale or no longer at that risk. |
+
+Then verify interruption in two separate cases:
+
+1. **Stationary book:** while its reading is playing, leave the same book/
+   obstacle in place. An unchanged repeat should queue, not call
+   `speech_interrupt force=True`, and should not repeatedly cut off the
+   reading. It may speak between chunks.
+2. **New or closer obstacle:** add a separate obstacle, or move the existing
+   one materially closer. Record `speech_interrupt force=True`,
+   `hazard_to_tts_start`, and whether the STOP is heard before the remaining
+   OCR chunks. It should interrupt promptly; a risk-2 caution should not kill
+   the reading.
+
+Finally, without restarting, say `read that` and then `detection on`. Confirm
+`vosk_nonempty`, `command_routed`, and `ocr_triggered` increment after the
+reading, and check `[voice summary]` for `recoveries`/`audio_frames`. If the
+watchdog fired, include the preceding `listen_wait` line and the next
+`listen_return` or absence of it.
+
+Report separate numbers for preview vs. still and for each distance: the
+printed text, what the hat actually read, accepted pages, rejected pages,
+wrong/gibberish speech, OCR time, time to first useful speech, the longest
+`high-res still frame gap`, and whether a new/closer STOP interrupted within
+1 s. State separately whether an unchanged stationary repeat stayed queued.
+
 ## 4. Recommendation based on the current evidence
 
 - **Keep YOLO11n at 320 as the default** until our Pi benchmark shows a
@@ -691,6 +819,12 @@ fixed, or the vocabulary upgrade successful, until these Pi logs exist.
 
 ## 5. What remains unverified
 
+- Actual OCR acceptance/rejection rates, high-resolution still latency, and
+  time to first useful speech on a real book page. The new gate is repo-side
+  only until the Pi A/B run in 3.7.
+- Whether a new/escalated/materially closer STOP interrupts promptly with OCR
+  chunks active, while an unchanged stationary repeat does not keep cutting off
+  the reading.
 - Actual microphone recognition rates for the new aliases on the Pi.
 - Whether TTS overlap is the dominant cause of missed commands, and whether the
   opt-in cooldown helps without hiding commands.

@@ -594,9 +594,44 @@ ENABLE_OCR_READING = True
 OCR_BINARY = "tesseract"
 OCR_LANGUAGE = "eng"
 OCR_PSM = 3                      # 3 = fully automatic page segmentation
-OCR_TIMEOUT_SECONDS = 10
+OCR_TIMEOUT_SECONDS = 20
 OCR_MAX_SPEECH_CHARS = 600       # cap spoken text at a whole-word boundary
 OCR_TRIGGER_COOLDOWN_SECONDS = 2.0
+
+# OCR quality gate. Tesseract confidence alone is not enough: the Pi log
+# returned 996 characters of gibberish with many plausible-looking tokens.
+# Accept only when confidence and language-likeness agree; otherwise speak one
+# short retry instruction instead of reading garbage.
+OCR_QUALITY_CHECK = os.environ.get(
+    "WHISPER_HAT_OCR_QUALITY", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+OCR_QUALITY_GOOD_CONF = 60.0
+OCR_QUALITY_MIN_MEAN_CONF = 55.0
+OCR_QUALITY_MIN_GOOD_WORD_RATIO = 0.50
+OCR_QUALITY_MIN_ALPHA_RATIO = 0.55
+OCR_QUALITY_MIN_VOWEL_WORD_RATIO = 0.55
+OCR_QUALITY_MAX_LONG_CONSONANT_RATIO = 0.25
+OCR_QUALITY_MIN_COMMON_WORD_RATIO = 0.12
+OCR_QUALITY_COMMON_WORD_MIN_COUNT = 8
+OCR_QUALITY_MIN_WORDS_FOR_CONFIDENCE = 2
+OCR_QUALITY_MIN_SINGLE_WORD_CONF = 80.0
+
+# Speak the first chunk quickly instead of one 600-character block. Three
+# chunks of about 180 characters keep any single pw-play call below the 20 s
+# timeout and let a genuinely urgent STOP jump the queue sooner.
+OCR_SPEECH_CHUNK_CHARS = 180
+OCR_MAX_SPEECH_CHUNKS = 3
+
+# Capture a still only for "read this". The detection stream stays at
+# CAMERA_WIDTH x CAMERA_HEIGHT. The still is downscaled to OCR_MAX_WIDTH before
+# Tesseract so higher detail does not multiply OCR time without bound.
+OCR_USE_STILL = os.environ.get(
+    "WHISPER_HAT_OCR_STILL", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+OCR_STILL_WIDTH = int(os.environ.get("WHISPER_HAT_OCR_STILL_WIDTH", "1920"))
+OCR_STILL_HEIGHT = int(os.environ.get("WHISPER_HAT_OCR_STILL_HEIGHT", "1440"))
+OCR_MAX_WIDTH = int(os.environ.get("WHISPER_HAT_OCR_MAX_WIDTH", "1024"))
+OCR_STILL_CAPTURE_WAIT_SECONDS = 8.0
 OCR_READ_PHRASES = (
     "read this",
     "read that",
@@ -767,6 +802,10 @@ GLOBAL_STOP_GAP_SECONDS = 0.5
 # A class/zone must disappear this long before its alert history is forgotten.
 ALERT_REARM_AFTER_ABSENT_SECONDS = 4.0
 
+# A queued routine repeat is rechecked at dequeue time. If the hazard has not
+# been refreshed recently, or has dropped below the queued risk, skip it.
+HAZARD_REPEAT_PRESENT_MAX_AGE_SECONDS = 1.5
+
 # Distance and tracking histories can expire sooner without forgetting that an
 # alert was already spoken.
 TRACK_STALE_SECONDS = 3.0
@@ -919,6 +958,7 @@ ocr_trigger_event = threading.Event()
 ocr_stop_event = threading.Event()
 ocr_worker_thread = None
 ocr_camera_source = None
+ocr_frame_origin = "none"
 last_ocr_trigger_time = 0.0
 ocr_last_trigger_monotonic = 0.0
 current_ocr_process = None
@@ -2833,6 +2873,27 @@ def _speak_message_now_inner(message, count_command=False):
                 pass
 
 
+def hazard_still_present(alert_key, risk, distance_m=None, now=None,
+                         max_age=None):
+    """Return True only when a queued repeat still has a fresh hazard."""
+    if not alert_key:
+        return True
+    now = time.time() if now is None else now
+    max_age = (
+        HAZARD_REPEAT_PRESENT_MAX_AGE_SECONDS
+        if max_age is None else max_age
+    )
+    with state_lock:
+        mem = track_memory.get(alert_key)
+        if mem is None:
+            return False
+        if now - mem.get("last_seen", 0.0) > max_age:
+            return False
+        if risk is not None and int(risk) > int(mem.get("last_risk", 0)):
+            return False
+    return True
+
+
 def _speech_worker():
     """Speak one queued message at a time, highest-risk messages first."""
     global current_audio_protected
@@ -2847,6 +2908,23 @@ def _speech_worker():
 
             origin_perf = origin[0] if len(origin) > 0 else None
             origin_label = origin[1] if len(origin) > 1 else "speech"
+            alert_key = origin[2] if len(origin) > 2 else None
+            alert_risk = origin[3] if len(origin) > 3 else None
+            alert_distance_m = origin[4] if len(origin) > 4 else None
+            alert_repeat = bool(origin[5]) if len(origin) > 5 else False
+
+            if alert_repeat and not hazard_still_present(
+                alert_key, alert_risk, alert_distance_m,
+            ):
+                _voice_debug(
+                    "speech_repeat_dropped",
+                    reason="hazard_not_present",
+                    alert_key=alert_key,
+                    risk=alert_risk,
+                    queue=speech_queue.qsize(),
+                    message=repr(message),
+                )
+                continue
 
             current_audio_protected = bool(protected)
             _voice_debug(
@@ -2960,14 +3038,16 @@ def interrupt_current_speech(force=False):
 
 
 def play_alert_sound(risk, message, protected=False, urgent=None,
-                     origin_perf=None, origin_label="speech"):
+                     origin_perf=None, origin_label="speech",
+                     priority=None, alert_key=None, alert_risk=None,
+                     alert_distance_m=None, alert_repeat=False):
     """Queue speech without blocking camera and YOLO processing.
 
     Risk 3 receives the highest priority. Emotion announcements use risk 0,
     so they wait behind STOP, Caution, and Notice messages already queued.
 
-    ``urgent`` defaults to True for STOP. Routine repeated STOP messages pass
-    urgent=False so they do not clear a user command response every few seconds.
+    ``urgent`` defaults to True for STOP. Callers pass False for an unchanged
+    repeated STOP so it cannot keep cutting off an OCR reading.
     """
     global speech_sequence
 
@@ -3004,14 +3084,18 @@ def play_alert_sound(risk, message, protected=False, urgent=None,
             speech_sequence += 1
             sequence = speech_sequence
 
-        priority = -int(risk)
+        queue_priority = -int(risk) if priority is None else int(priority)
         speech_queue.put_nowait((
-            priority,
+            queue_priority,
             sequence,
             message,
             bool(protected),
             origin_perf if origin_perf is not None else time.perf_counter(),
             origin_label,
+            alert_key,
+            risk if alert_risk is None else alert_risk,
+            alert_distance_m,
+            bool(alert_repeat),
         ))
         return True
     except queue.Full:
@@ -3022,7 +3106,8 @@ def play_alert_sound(risk, message, protected=False, urgent=None,
         return False
 
 
-def _play_direct_response(message, risk=2, origin_perf=None, origin_label="command"):
+def _play_direct_response(message, risk=2, origin_perf=None, origin_label="command",
+                          priority=None):
     """Queue an answer to a user command with routine-repeat protection."""
     try:
         return play_alert_sound(
@@ -3031,14 +3116,34 @@ def _play_direct_response(message, risk=2, origin_perf=None, origin_label="comma
             protected=True,
             origin_perf=origin_perf,
             origin_label=origin_label,
+            priority=priority,
         )
     except TypeError:
         # Compatibility with test/double wrappers that still accept (risk, msg).
         return play_alert_sound(risk, message)
 
 
-def _play_safety_alert(risk, message, urgent, origin_perf=None):
-    """Queue a hazard alert, marking only new/escalated hazards as urgent."""
+def safety_alert_is_urgent(risk, decision=None):
+    """Only a changed STOP interrupts an active answer.
+
+    A new, escalated, or materially closer hazard interrupts immediately. An
+    unchanged repeat of the same STOP queues normally, so a stationary book
+    does not repeatedly cut off its own reading.
+    """
+    decision = decision or {}
+    return bool(
+        int(risk) >= 3
+        and (
+            decision.get("new")
+            or decision.get("escalated")
+            or decision.get("materially_closer")
+        )
+    )
+
+
+def _play_safety_alert(risk, message, urgent, origin_perf=None,
+                       alert_key=None, alert_distance_m=None, repeat=False):
+    """Queue a hazard alert; only a changed STOP is urgent."""
     try:
         return play_alert_sound(
             risk,
@@ -3046,6 +3151,10 @@ def _play_safety_alert(risk, message, urgent, origin_perf=None):
             urgent=urgent,
             origin_perf=origin_perf,
             origin_label="hazard",
+            alert_key=alert_key,
+            alert_risk=risk,
+            alert_distance_m=alert_distance_m,
+            alert_repeat=repeat,
         )
     except TypeError:
         # Compatibility with test/double wrappers that still accept (risk, msg).
@@ -3529,11 +3638,18 @@ def _voice_control_worker():
                         break
 
                 listen_started = time.monotonic()
+                stream = getattr(source, "stream", None)
+                try:
+                    stream_active = bool(stream.is_active())
+                except Exception:
+                    stream_active = None
                 _voice_debug(
                     "listen_wait",
                     timeout_s=VOICE_LISTEN_TIMEOUT,
+                    phrase_limit_s=VOICE_PHRASE_TIME_LIMIT,
                     tts_active=speech_active_event.is_set(),
                     queue=speech_queue.qsize(),
+                    stream_active=stream_active,
                 )
                 try:
                     audio = recognizer.listen(
@@ -3551,6 +3667,11 @@ def _voice_control_worker():
                     )
                     continue
 
+                _voice_debug(
+                    "listen_return",
+                    elapsed_s=round(time.monotonic() - listen_started, 3),
+                    tts_active=speech_active_event.is_set(),
+                )
                 tts_overlap = speech_active_event.is_set()
                 voice_audio_frames += 1
                 voice_audio_bytes += len(audio.frame_data)
@@ -3743,9 +3864,15 @@ def _voice_watchdog_check(now=None):
             )
             return False
 
+        last_audio_age = (
+            None if voice_last_audio_monotonic <= 0.0
+            else round(now - voice_last_audio_monotonic, 1)
+        )
         print(
             "[voice watchdog] no listener progress for "
-            f"{heartbeat_age:.1f}s at stage={voice_listener_stage}; "
+            f"{heartbeat_age:.1f}s at stage={voice_listener_stage} "
+            f"tts_active={speech_active_event.is_set()} "
+            f"last_audio_age_s={last_audio_age}; "
             "closing the capture stream to unblock the read.",
             flush=True,
         )
@@ -3888,21 +4015,279 @@ def _clean_ocr_text(text):
     return " ".join(kept)
 
 
+def _split_ocr_speech_chunks(text):
+    """Split readable OCR text into short, speakable chunks.
+
+    The first chunk is deliberately short so the user hears useful content
+    before a long OCR block can occupy the speech worker. Cuts prefer sentence
+    punctuation, then whitespace; never split inside a word.
+    """
+    remaining = _clean_ocr_text(text)
+    if not remaining:
+        return []
+
+    chunks = []
+    limit = max(40, int(OCR_SPEECH_CHUNK_CHARS))
+    for _ in range(max(1, int(OCR_MAX_SPEECH_CHUNKS))):
+        if not remaining:
+            break
+        if len(remaining) <= limit:
+            chunks.append(remaining.strip())
+            break
+
+        window = remaining[: limit + 1]
+        cut = max(
+            window.rfind(". "),
+            window.rfind("? "),
+            window.rfind("! "),
+            window.rfind("; "),
+            window.rfind(", "),
+        )
+        if cut < int(limit * 0.5):
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        else:
+            cut += 1
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut:].strip()
+
+    return [chunk for chunk in chunks if chunk]
+
+
+def _prepare_ocr_frame(frame):
+    """Resize a still/read frame down to the OCR working width."""
+    if frame is None:
+        return None
+    height, width = frame.shape[:2]
+    if width <= OCR_MAX_WIDTH or width <= 0:
+        return frame
+    scale = OCR_MAX_WIDTH / float(width)
+    return cv2.resize(
+        frame,
+        (OCR_MAX_WIDTH, max(1, int(round(height * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def _grab_ocr_frame(source):
-    """One clean frame for OCR: peek without consuming, else fall back to read."""
+    """Prefer one high-resolution still, then peek/read the detection frame."""
+    global ocr_frame_origin
+    ocr_frame_origin = "none"
     if source is None:
         return None
+
+    if OCR_USE_STILL:
+        capture_still = getattr(source, "capture_still", None)
+        if callable(capture_still):
+            still_started = time.monotonic()
+            try:
+                frame = capture_still()
+            except Exception as error:
+                _voice_debug(
+                    "ocr_still_failed",
+                    elapsed_s=round(time.monotonic() - still_started, 3),
+                    error=f"{type(error).__name__}: {error}",
+                )
+            else:
+                if frame is not None:
+                    ocr_frame_origin = "still"
+                    _voice_debug(
+                        "ocr_still_captured",
+                        elapsed_s=round(time.monotonic() - still_started, 3),
+                        shape=getattr(frame, "shape", None),
+                    )
+                    return frame
+
     peek = getattr(source, "peek_latest", None)
     if callable(peek):
         frame = peek()
         if frame is not None:
+            ocr_frame_origin = "peek"
             return frame
+
     ret, frame = source.read()
+    ocr_frame_origin = "read" if ret and frame is not None else "none"
     return frame if ret else None
 
 
-def _run_tesseract(frame):
-    """Encode the frame as PNG and pipe it through Tesseract (stdin -> stdout)."""
+def _ocr_frame_metrics(frame):
+    """Cheap focus/brightness diagnostics for a real book-page test."""
+    if frame is None:
+        return {}
+    gray = (
+        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if frame.ndim == 3 else frame
+    )
+    return {
+        "blur_score": round(float(cv2.Laplacian(gray, cv2.CV_64F).var()), 2),
+        "brightness": round(float(gray.mean()), 1),
+        "contrast": round(float(gray.std()), 1),
+    }
+
+
+# A small function-word list is enough to separate real prose from the
+# letter-shaped noise seen on the Pi. It is deliberately not a full dictionary:
+# technical pages often contain names, numbers, and jargon, but prose still
+# contains "the", "and", "of", "to", "in", and similar words.
+OCR_COMMON_WORDS = frozenset("""
+a about after again all also am an and any are as at be because been before
+being between both but by can could did do does doing down each even first for
+from further get give go had has have having he her here hers herself him
+himself his how i if in into is it its itself just know like make me more most
+my myself new no nor not now of off on once only or other our ours ourselves
+out over own same say see she should so some such than that the their theirs
+them themselves then there these they this those through to too under until up
+us very was we were what when where which while who whom why will with would
+you your yours yourself yourselves
+""".split())
+
+
+def _longest_consonant_run(word):
+    vowels = set("aeiouy")
+    longest = current = 0
+    for char in word.lower():
+        if char.isalpha() and char not in vowels:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def _ocr_text_metrics(text, words):
+    """Confidence and language-likeness metrics for the OCR quality gate."""
+    tokens = [str(word).strip() for word, _conf in words if str(word).strip()]
+    confidences = [
+        float(conf) for _word, conf in words
+        if conf is not None and float(conf) >= 0.0
+    ]
+    word_count = len(tokens)
+    visible = [char for char in text if not char.isspace()]
+    alpha_ratio = (
+        sum(char.isalpha() for char in visible) / len(visible)
+        if visible else 0.0
+    )
+    vowel_words = sum(
+        1 for word in tokens
+        if len([char for char in word if char.isalpha()]) >= 2
+        and any(char.lower() in "aeiouy" for char in word if char.isalpha())
+    )
+    long_consonant_words = sum(
+        1 for word in tokens if _longest_consonant_run(word) >= 6
+    )
+    normalized = [
+        "".join(char.lower() for char in word if char.isalpha())
+        for word in tokens
+    ]
+    common_words = sum(
+        1 for word in normalized if word in OCR_COMMON_WORDS
+    )
+    return {
+        "word_count": word_count,
+        "mean_conf": (
+            sum(confidences) / len(confidences) if confidences else 0.0
+        ),
+        "good_word_ratio": (
+            sum(conf >= OCR_QUALITY_GOOD_CONF for conf in confidences)
+            / len(confidences)
+            if confidences else 0.0
+        ),
+        "alpha_ratio": alpha_ratio,
+        "vowel_word_ratio": vowel_words / word_count if word_count else 0.0,
+        "long_consonant_ratio": (
+            long_consonant_words / word_count if word_count else 0.0
+        ),
+        "common_word_ratio": (
+            common_words / word_count if word_count else 0.0
+        ),
+    }
+
+
+def _ocr_quality_ok(metrics):
+    """True only when the OCR result is plausibly readable text."""
+    if not OCR_QUALITY_CHECK:
+        return True
+    word_count = int(metrics.get("word_count", 0))
+    if word_count <= 0:
+        return False
+
+    mean_conf = float(metrics.get("mean_conf", 0.0))
+    alpha_ratio = float(metrics.get("alpha_ratio", 0.0))
+    vowel_ratio = float(metrics.get("vowel_word_ratio", 0.0))
+    long_consonant_ratio = float(metrics.get("long_consonant_ratio", 0.0))
+    common_word_ratio = float(metrics.get("common_word_ratio", 0.0))
+
+    if (
+        word_count >= OCR_QUALITY_COMMON_WORD_MIN_COUNT
+        and common_word_ratio < OCR_QUALITY_MIN_COMMON_WORD_RATIO
+    ):
+        return False
+
+    if word_count < OCR_QUALITY_MIN_WORDS_FOR_CONFIDENCE:
+        return (
+            mean_conf >= OCR_QUALITY_MIN_SINGLE_WORD_CONF
+            and alpha_ratio >= OCR_QUALITY_MIN_ALPHA_RATIO
+            and vowel_ratio >= OCR_QUALITY_MIN_VOWEL_WORD_RATIO
+            and long_consonant_ratio <= OCR_QUALITY_MAX_LONG_CONSONANT_RATIO
+        )
+
+    return (
+        mean_conf >= OCR_QUALITY_MIN_MEAN_CONF
+        and float(metrics.get("good_word_ratio", 0.0))
+        >= OCR_QUALITY_MIN_GOOD_WORD_RATIO
+        and alpha_ratio >= OCR_QUALITY_MIN_ALPHA_RATIO
+        and vowel_ratio >= OCR_QUALITY_MIN_VOWEL_WORD_RATIO
+        and long_consonant_ratio <= OCR_QUALITY_MAX_LONG_CONSONANT_RATIO
+    )
+
+
+def _parse_tesseract_tsv(output):
+    """Parse Tesseract TSV into text, word confidences, and metrics."""
+    lines = []
+    word_rows = []
+    text_left = text_top = float("inf")
+    text_right = text_bottom = 0.0
+    for row in output.splitlines()[1:]:
+        parts = row.split("\t")
+        if len(parts) < 12:
+            continue
+        word = parts[11].strip()
+        if not word:
+            continue
+        try:
+            confidence = float(parts[10])
+            left = float(parts[6])
+            top = float(parts[7])
+            width = float(parts[8])
+            height = float(parts[9])
+        except ValueError:
+            continue
+        if confidence < 0:
+            continue
+        key = (parts[1], parts[2], parts[3], parts[4])
+        if not lines or lines[-1][0] != key:
+            lines.append((key, []))
+        lines[-1][1].append(word)
+        word_rows.append((word, confidence))
+        text_left = min(text_left, left)
+        text_top = min(text_top, top)
+        text_right = max(text_right, left + width)
+        text_bottom = max(text_bottom, top + height)
+
+    text = "\n".join(" ".join(words) for _key, words in lines)
+    metrics = _ocr_text_metrics(text, word_rows)
+    metrics["text_box"] = (
+        None if not word_rows
+        else (text_left, text_top, text_right, text_bottom)
+    )
+    return text, word_rows, metrics
+
+
+def _run_tesseract_command(frame, extra_args=None):
+    """Encode the frame as PNG and pipe it through Tesseract."""
     global current_ocr_process
     ok, buffer = cv2.imencode(".png", frame)
     if not ok:
@@ -3914,6 +4299,8 @@ def _run_tesseract(frame):
         "-l", OCR_LANGUAGE,
         "--psm", str(OCR_PSM),
     ]
+    if extra_args:
+        command.extend(extra_args)
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -3939,6 +4326,17 @@ def _run_tesseract(frame):
             current_ocr_process = None
 
 
+def _run_tesseract(frame):
+    """Plain-text Tesseract call retained for the benchmark/backward tests."""
+    return _run_tesseract_command(frame)
+
+
+def _run_tesseract_tsv(frame):
+    """TSV Tesseract call with word confidences for the quality gate."""
+    output = _run_tesseract_command(frame, ["tsv"])
+    return _parse_tesseract_tsv(output)
+
+
 def _perform_ocr_read(source):
     """Grab one frame, read it, and speak the result at caution priority (2).
 
@@ -3962,10 +4360,19 @@ def _perform_ocr_read(source):
         return
 
     frame = _grab_ocr_frame(source)
+    original_shape = None if frame is None else frame.shape
+    original_metrics = _ocr_frame_metrics(frame)
+    frame = _prepare_ocr_frame(frame)
     _voice_debug(
         "ocr_frame",
         elapsed_s=round(time.monotonic() - started, 3),
-        frame_shape=None if frame is None else frame.shape,
+        frame_origin=ocr_frame_origin,
+        original_shape=original_shape,
+        ocr_shape=None if frame is None else frame.shape,
+        original_blur_score=original_metrics.get("blur_score"),
+        original_brightness=original_metrics.get("brightness"),
+        original_contrast=original_metrics.get("contrast"),
+        **_ocr_frame_metrics(frame),
     )
     if frame is None:
         _play_direct_response(
@@ -3975,7 +4382,7 @@ def _perform_ocr_read(source):
         return
 
     try:
-        raw_text = _run_tesseract(frame)
+        raw_text, words, metrics = _run_tesseract_tsv(frame)
     except Exception as error:
         _voice_debug("ocr_failed", error=f"{type(error).__name__}: {error}")
         _play_direct_response(
@@ -3985,10 +4392,26 @@ def _perform_ocr_read(source):
         return
 
     text = _clean_ocr_text(raw_text)
+    quality_ok = _ocr_quality_ok(metrics)
     _voice_debug(
         "ocr_tesseract_done",
         raw_chars=len(raw_text),
         chars=len(text),
+        words=metrics.get("word_count"),
+        mean_conf=round(float(metrics.get("mean_conf", 0.0)), 1),
+        good_word_ratio=round(float(metrics.get("good_word_ratio", 0.0)), 3),
+        alpha_ratio=round(float(metrics.get("alpha_ratio", 0.0)), 3),
+        vowel_word_ratio=round(float(metrics.get("vowel_word_ratio", 0.0)), 3),
+        long_consonant_ratio=round(
+            float(metrics.get("long_consonant_ratio", 0.0)), 3
+        ),
+        common_word_ratio=round(
+            float(metrics.get("common_word_ratio", 0.0)), 3
+        ),
+        quality_ok=quality_ok,
+        frame_origin=ocr_frame_origin,
+        text_box=metrics.get("text_box"),
+        frame_shape=None if frame is None else frame.shape,
         elapsed_s=round(time.monotonic() - started, 3),
     )
     if not text:
@@ -3997,18 +4420,54 @@ def _perform_ocr_read(source):
             origin_perf=ocr_last_trigger_monotonic,
         )
         return
-    queued = _play_direct_response(
-        text,
-        origin_perf=ocr_last_trigger_monotonic,
-        origin_label="command",
-    )
+    if not quality_ok:
+        _voice_debug(
+            "ocr_quality_rejected",
+            raw_chars=len(raw_text),
+            chars=len(text),
+            elapsed_s=round(time.monotonic() - started, 3),
+        )
+        _play_direct_response(
+            "I couldn't read the page. Hold it steady and try again.",
+            origin_perf=ocr_last_trigger_monotonic,
+        )
+        return
+
+    chunks = _split_ocr_speech_chunks(text)
+    queued_count = 0
+    for index, chunk in enumerate(chunks):
+        queued = _play_direct_response(
+            chunk,
+            origin_perf=ocr_last_trigger_monotonic if index == 0 else None,
+            origin_label="command" if index == 0 else "speech",
+            # First chunk keeps risk-2 priority. Later chunks sit below routine
+            # risk-1/2 repeats so those can speak between chunks.
+            priority=None if index == 0 else 0,
+        )
+        if queued:
+            queued_count += 1
+        else:
+            break
+
+    elapsed_s = round(time.monotonic() - started, 3)
     _voice_debug(
         "ocr_speech_queued",
-        queued=queued,
-        elapsed_s=round(time.monotonic() - started, 3),
+        queued=bool(queued_count),
+        chunks=len(chunks),
+        queued_chunks=queued_count,
+        chars=len(text),
+        first_chunk_chars=len(chunks[0]) if chunks else 0,
+        elapsed_s=elapsed_s,
         tts_active=speech_active_event.is_set(),
         queue=speech_queue.qsize(),
     )
+    if chunks:
+        _voice_debug(
+            "ocr_first_chunk_queued",
+            chars=len(chunks[0]),
+            chunks=len(chunks),
+            elapsed_s=elapsed_s,
+        )
 
 
 def _trigger_ocr_reading():
@@ -4936,6 +5395,11 @@ class LatestFrameSource:
         self.last_returned_sequence = 0
         self.running = True
         self.failed = False
+        self.last_frame_monotonic = 0.0
+        self.still_capture_started_monotonic = None
+        self.still_capture_active = False
+        self.last_still_gap_s = None
+        self.max_still_gap_s = 0.0
         self.thread = threading.Thread(
             target=self._capture_loop,
             name="latest-camera-frame",
@@ -4960,10 +5424,43 @@ class LatestFrameSource:
                 time.sleep(0.05)
                 continue
             consecutive_failures = 0
-            with self.condition:
-                self.latest_frame = frame
-                self.sequence += 1
-                self.condition.notify_all()
+            self._note_detection_frame(frame, time.monotonic())
+
+    def _note_detection_frame(self, frame, frame_time):
+        """Publish a fresh frame and measure any high-res-still blind window."""
+        gap_to_log = None
+        with self.condition:
+            if (
+                self.still_capture_started_monotonic is not None
+                and self.last_frame_monotonic
+            ):
+                live_gap = frame_time - self.last_frame_monotonic
+                self.max_still_gap_s = max(
+                    self.max_still_gap_s, live_gap
+                )
+            if (
+                self.still_capture_started_monotonic is not None
+                and not self.still_capture_active
+            ):
+                gap = frame_time - self.still_capture_started_monotonic
+                self.last_still_gap_s = gap
+                self.max_still_gap_s = max(self.max_still_gap_s, gap)
+                self.still_capture_started_monotonic = None
+                if gap >= 0.20:
+                    gap_to_log = (
+                        gap, self.max_still_gap_s
+                    )
+            self.last_frame_monotonic = frame_time
+            self.latest_frame = frame
+            self.sequence += 1
+            self.condition.notify_all()
+        if gap_to_log is not None:
+            print(
+                "[camera] high-res still frame gap="
+                f"{gap_to_log[0]:.3f}s max={gap_to_log[1]:.3f}s; "
+                "detection and obstacle alerts paused until the next frame",
+                flush=True,
+            )
 
     def is_opened(self):
         return self.source.is_opened() and not self.failed
@@ -4976,6 +5473,11 @@ class LatestFrameSource:
                 and self.sequence <= self.last_returned_sequence
                 and time.time() < deadline
             ):
+                if self.still_capture_active:
+                    deadline = max(
+                        deadline,
+                        time.time() + OCR_STILL_CAPTURE_WAIT_SECONDS,
+                    )
                 self.condition.wait(timeout=0.10)
 
             if self.sequence <= self.last_returned_sequence or self.latest_frame is None:
@@ -4995,6 +5497,25 @@ class LatestFrameSource:
             if self.latest_frame is None:
                 return None
             return self.latest_frame.copy()
+
+    def capture_still(self):
+        """Ask the underlying camera for a one-off high-resolution still."""
+        capture = getattr(self.source, "capture_still", None)
+        if not callable(capture):
+            return None
+
+        with self.condition:
+            self.still_capture_started_monotonic = (
+                self.last_frame_monotonic or time.monotonic()
+            )
+            self.still_capture_active = True
+            self.condition.notify_all()
+        try:
+            return capture()
+        finally:
+            with self.condition:
+                self.still_capture_active = False
+                self.condition.notify_all()
 
     def release(self):
         self.running = False
@@ -5035,6 +5556,9 @@ class Picamera2Source:
         )
 
         self.picam2.configure(config)
+        self.transform = transform
+        self.still_config = None
+        self.io_lock = threading.Lock()
 
         sensor_model = self.picam2.camera_properties.get("Model", "unknown")
         print(f"Picamera2 opened camera index {PICAMERA2_CAMERA_INDEX}: {sensor_model}")
@@ -5069,11 +5593,48 @@ class Picamera2Source:
 
     def read(self):
         try:
-            frame_bgr = self.picam2.capture_array("main")
+            with self.io_lock:
+                frame_bgr = self.picam2.capture_array("main")
             return True, frame_bgr
         except Exception as e:
             print(f"Picamera2 frame read failed: {e}")
             return False, None
+
+    def capture_still(self):
+        """Capture one OCR still without changing the preview stream size."""
+        switch_capture = getattr(
+            self.picam2, "switch_mode_and_capture_array", None
+        )
+        if not callable(switch_capture):
+            return None
+
+        with self.io_lock:
+            if self.still_config is None:
+                try:
+                    self.still_config = self.picam2.create_still_configuration(
+                        main={
+                            "size": (OCR_STILL_WIDTH, OCR_STILL_HEIGHT),
+                            "format": "RGB888",
+                        },
+                        transform=self.transform,
+                        buffer_count=1,
+                    )
+                except Exception as error:
+                    print(
+                        "[ocr] high-resolution still configuration failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    self.still_config = False
+            if self.still_config is False:
+                return None
+            try:
+                return switch_capture(self.still_config, "main")
+            except Exception as error:
+                print(
+                    "[ocr] high-resolution still capture failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+                return None
 
     def release(self):
         try:
@@ -5728,19 +6289,22 @@ def main():
 
                     if message:
                         print(message)
-                        # Only a new/escalated/materially-closer STOP may
-                        # interrupt active speech. Notices/cautions queue at
-                        # their priority instead of killing pw-play every 0.5s.
-                        urgent = bool(
-                            best_risk >= 3
-                            and (
-                                last_alert_decision.get("new")
-                                or last_alert_decision.get("escalated")
-                                or last_alert_decision.get("materially_closer")
-                            )
+                        # A new, escalated, or materially closer STOP
+                        # interrupts immediately. An unchanged repeat queues
+                        # normally so a stationary book does not keep cutting
+                        # off its own reading; queued repeats are rechecked
+                        # again at dequeue time.
+                        urgent = safety_alert_is_urgent(
+                            best_risk, last_alert_decision,
                         )
                         safety_message_queued = _play_safety_alert(
-                            best_risk, message, urgent, origin_perf=frame_perf
+                            best_risk, message, urgent,
+                            origin_perf=frame_perf,
+                            alert_key=best_alert_key,
+                            alert_distance_m=best_distance_m,
+                            repeat=bool(
+                                last_alert_decision.get("repeat")
+                            ),
                         )
 
                         if best_debug is not None:
