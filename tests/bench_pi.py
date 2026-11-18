@@ -1,4 +1,4 @@
-"""Reproducible Raspberry Pi 5 benchmark for Whispering Hat.
+r"""Reproducible Raspberry Pi 5 benchmark for Whispering Hat.
 
 This script is intentionally explicit about what it measures. It does NOT
 pretend that an x86 desktop run is a Pi measurement. Run it on the Pi 5 and
@@ -26,9 +26,19 @@ Combined load (detection + TTS + offline voice listening):
         --voice \
         --json-out bench/results-combined.json
 
+Open-vocabulary candidate and named-scene scoring:
+
+    python tests/bench_pi.py \
+        --open-vocab --models yoloe-11s-seg.pt \
+        --images bench/scenes --imgsz 320 --loops 5 \
+        --labels bench/labels.json \
+        --json-out bench/yoloe.json
+
 Scene images must be captured with the production camera settings (640x480,
 same autofocus/exposure, no HUD overlay). Use the same directory for every
-candidate, otherwise the comparison is not valid.
+candidate, otherwise the comparison is not valid. A labels JSON entry can be a
+name/list or an object with `expected` and `tof_visible` so generic and missed
+outcomes stay separate.
 """
 import argparse
 import json
@@ -153,6 +163,101 @@ def _load_image(path):
     return image
 
 
+def _name_matches(expected, detected):
+    expected = str(expected).strip().lower()
+    detected = str(detected).strip().lower()
+    return bool(expected) and (
+        expected == detected or expected in detected or detected in expected
+    )
+
+
+def _load_labels(path):
+    if not path:
+        return None
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit("--labels must be a JSON object: {image: expected_name_or_list}")
+    labels = {}
+    for image, spec in data.items():
+        if isinstance(spec, dict):
+            expected = spec.get("expected", spec.get("labels", []))
+            tof_visible = spec.get("tof_visible", spec.get("tof"))
+        else:
+            expected = spec
+            tof_visible = None
+        if isinstance(expected, str):
+            expected = [expected]
+        labels[Path(image).name] = {
+            "expected": [str(item) for item in expected],
+            "tof_visible": tof_visible,
+        }
+    return labels
+
+
+def _evaluate_named_detections(labels_path, per_image_detections):
+    """Model-side correctness, without pretending to know ToF ground truth.
+
+    No named detection is reported as generic_or_missed: the production app
+    still has the generic ToF warning in that case. Wrong means the model
+    returned a name, but not one of the expected aliases.
+    """
+    labels = _load_labels(labels_path)
+    if labels is None:
+        return None
+    detected_by_name = {
+        Path(path).name: names for path, names in per_image_detections.items()
+    }
+    counts = {
+        "correct": 0, "wrong": 0, "generic": 0, "missed": 0,
+        "generic_or_missed": 0, "unlabeled": 0,
+    }
+    details = []
+    for image_name, spec in labels.items():
+        expected = spec["expected"]
+        tof_visible = spec["tof_visible"]
+        detected = detected_by_name.get(image_name, [])
+        if not expected:
+            counts["unlabeled"] += 1
+            outcome = "unlabeled"
+        elif any(
+            _name_matches(expected_name, detected_name)
+            for expected_name in expected
+            for detected_name in detected
+        ):
+            counts["correct"] += 1
+            outcome = "correct"
+        elif detected:
+            counts["wrong"] += 1
+            outcome = "wrong"
+        elif tof_visible is True:
+            counts["generic"] += 1
+            outcome = "generic"
+        elif tof_visible is False:
+            counts["missed"] += 1
+            outcome = "missed"
+        else:
+            counts["generic_or_missed"] += 1
+            outcome = "generic_or_missed"
+        details.append({
+            "image": image_name,
+            "expected": expected,
+            "tof_visible": tof_visible,
+            "detected": detected,
+            "outcome": outcome,
+        })
+    total = max(1, sum(counts.values()) - counts["unlabeled"])
+    return {
+        "counts": counts,
+        "rates": {
+            key: round(value / total, 3)
+            for key, value in counts.items()
+            if key != "unlabeled"
+        },
+        "per_image": details,
+        "note": "generic means ToF saw the obstacle but no class was named; missed means neither the model nor ToF flagged it; generic_or_missed is used when tof_visible was not supplied.",
+    }
+
+
 def _latency_stats(samples_ms):
     return {
         "count": len(samples_ms),
@@ -164,37 +269,60 @@ def _latency_stats(samples_ms):
     }
 
 
-def _benchmark_model(hat, model_ref, images, args):
+def _load_benchmark_model(hat, model_ref, args):
+    """Load either the COCO baseline or the opt-in YOLOE vocabulary."""
     from ultralytics import YOLO
 
-    load_started = time.perf_counter()
+    if args.open_vocab:
+        if Path(model_ref).suffix.lower() != ".pt":
+            # Exported model: classes are already baked in.
+            return YOLO(model_ref), None
+        try:
+            from ultralytics import YOLOE
+        except ImportError as error:
+            raise SystemExit(
+                "This ultralytics build has no YOLOE. Install a YOLOE-capable "
+                "version or use an exported model with baked classes. "
+                f"Original error: {error}"
+            )
+
+        model = YOLOE(model_ref)
+        if not args.open_vocab_prompt_free:
+            names = [name.strip() for name in args.open_vocab_classes.split(",") if name.strip()]
+            if names:
+                model.set_classes(names, model.get_text_pe(names))
+        return model, None
+
     model = YOLO(model_ref)
+    return model, hat.YOLO_CLASSES_TO_KEEP
+
+
+def _benchmark_model(hat, model_ref, images, args):
+    load_started = time.perf_counter()
+    model, classes = _load_benchmark_model(hat, model_ref, args)
     load_ms = (time.perf_counter() - load_started) * 1000.0
     try:
         model.fuse(verbose=False)
-    except TypeError:
+    except (TypeError, AttributeError):
         pass
 
     def infer(frame):
+        kwargs = {
+            "verbose": False,
+            "conf": args.conf,
+            "imgsz": args.imgsz,
+            "device": "cpu",
+        }
+        if classes is not None:
+            kwargs["classes"] = classes
         if args.tracking:
             return model.track(
                 frame,
                 persist=True,
                 tracker=hat.TRACKER_NAME,
-                verbose=False,
-                conf=args.conf,
-                imgsz=args.imgsz,
-                device="cpu",
-                classes=hat.YOLO_CLASSES_TO_KEEP,
+                **kwargs,
             )
-        return model.predict(
-            frame,
-            verbose=False,
-            conf=args.conf,
-            imgsz=args.imgsz,
-            device="cpu",
-            classes=hat.YOLO_CLASSES_TO_KEEP,
-        )
+        return model.predict(frame, **kwargs)
 
     # Preload frames so candidate comparisons do not include disk variance.
     frames = [_load_image(image_path) for image_path in images]
@@ -206,14 +334,19 @@ def _benchmark_model(hat, model_ref, images, args):
     latencies = []
     class_counts = {}
     detection_counts = []
+    per_image_detections = {}
     for _ in range(max(1, args.loops)):
-        for frame in frames:
+        for image_path, frame in zip(images, frames):
             started = time.perf_counter()
             results = infer(frame)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             latencies.append(elapsed_ms)
             detections = hat.extract_detections(results, model.names)
             detection_counts.append(len(detections))
+            per_image_detections.setdefault(
+                str(image_path),
+                sorted({detection[0] for detection in detections}),
+            )
             for class_name, _conf, *_rest in detections:
                 class_counts[class_name] = class_counts.get(class_name, 0) + 1
 
@@ -250,6 +383,14 @@ def _benchmark_model(hat, model_ref, images, args):
         },
         "class_counts": dict(sorted(class_counts.items())),
         "quality_on_labeled_set": quality,
+        "vocabulary": {
+            "open_vocab": bool(args.open_vocab),
+            "prompt_free": bool(args.open_vocab_prompt_free),
+            "classes": None if classes is not None else args.open_vocab_classes,
+        },
+        "named_detection_on_labeled_scenes": _evaluate_named_detections(
+            args.labels, per_image_detections,
+        ),
     }
 
 
@@ -304,7 +445,9 @@ def _summarize_app_latency_logs(paths):
     import re
 
     samples = {}
-    pattern = re.compile(r"\[latency\]\s+([a-z_]+)_to_tts_start=([0-9.]+)ms")
+    pattern = re.compile(
+        r"\[latency\]\s+([a-z_]+)_to_tts_start=([0-9.]+)ms(?:\s+message=(.*))?"
+    )
     for path in paths:
         try:
             lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -314,7 +457,13 @@ def _summarize_app_latency_logs(paths):
         for line in lines:
             match = pattern.search(line)
             if match:
-                samples.setdefault(match.group(1), []).append(float(match.group(2)))
+                label = match.group(1)
+                value = float(match.group(2))
+                samples.setdefault(label, []).append(value)
+                if label == "hazard":
+                    message = (match.group(3) or "").lower()
+                    kind = "generic" if "unknown obstacle" in message else "named"
+                    samples.setdefault(f"hazard_{kind}", []).append(value)
     summary = {
         key: _latency_stats(values)
         for key, values in samples.items()
@@ -326,12 +475,10 @@ def _summarize_app_latency_logs(paths):
 
 
 def _combined_load(hat, model_ref, images, args):
-    from ultralytics import YOLO
-
-    model = YOLO(model_ref)
+    model, classes = _load_benchmark_model(hat, model_ref, args)
     try:
         model.fuse(verbose=False)
-    except TypeError:
+    except (TypeError, AttributeError):
         pass
     frames = [_load_image(path) for path in images]
     stop = threading.Event()
@@ -344,16 +491,17 @@ def _combined_load(hat, model_ref, images, args):
             frame = frames[index % len(frames)]
             index += 1
             started = time.perf_counter()
-            model.track(
-                frame,
-                persist=True,
-                tracker=hat.TRACKER_NAME,
-                verbose=False,
-                conf=args.conf,
-                imgsz=args.imgsz,
-                device="cpu",
-                classes=hat.YOLO_CLASSES_TO_KEEP,
-            )
+            kwargs = {
+                "persist": True,
+                "tracker": hat.TRACKER_NAME,
+                "verbose": False,
+                "conf": args.conf,
+                "imgsz": args.imgsz,
+                "device": "cpu",
+            }
+            if classes is not None:
+                kwargs["classes"] = classes
+            model.track(frame, **kwargs)
             infer_latencies.append((time.perf_counter() - started) * 1000.0)
             counters["frames"] += 1
 
@@ -398,6 +546,7 @@ def _combined_load(hat, model_ref, images, args):
         "detection_latency": _latency_stats(infer_latencies),
         "tts_utterances": counters["tts"],
         "voice_control_started": counters["voice_started"],
+        "open_vocab": bool(args.open_vocab),
         "rss_end_mb": _current_rss_mb(),
         "peak_ram_mb": _peak_ram_mb(),
         "thermal_before": before,
@@ -417,6 +566,26 @@ def main():
     parser.add_argument("--no-tracking", dest="tracking", action="store_false")
     parser.add_argument("--val-data", default=None, help="Optional labeled YOLO data YAML")
     parser.add_argument("--val-split", default="val")
+    parser.add_argument(
+        "--labels", default=None,
+        help="JSON map of image filename -> expected name or alias list; "
+             "adds correct/wrong/generic_or_missed counts",
+    )
+    parser.add_argument("--open-vocab", action="store_true", help="Load YOLOE instead of YOLO")
+    parser.add_argument(
+        "--open-vocab-classes",
+        default=(
+            "chair,stool,bench,cardboard box,box,package,bag,backpack,handbag,"
+            "suitcase,trash can,bin,basket,laundry basket,shopping cart,cart,"
+            "shoe,shoes,table,desk,door,bucket,cooler,crate,traffic cone,"
+            "stroller,walker,vacuum cleaner,fan,heater,plant,pet bowl,cable,toy"
+        ),
+        help="Comma-separated fixed YOLOE prompts",
+    )
+    parser.add_argument(
+        "--open-vocab-prompt-free", action="store_true",
+        help="Use a YOLOE prompt-free/exported model with baked classes",
+    )
     parser.add_argument("--ocr", action="store_true", help="Benchmark Tesseract on the same frames")
     parser.add_argument("--tts-phrase", default=None, help="Benchmark one full TTS playback")
     parser.add_argument("--tts-loops", type=int, default=3)

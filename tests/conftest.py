@@ -72,6 +72,23 @@ def reset_state(mod, grid=None, now=1000.0):
     mod.reset_unknown_obstacle_state()
     mod.last_unknown_debug_time = 0.0
     mod._set_speech_active(False)
+    for name in (
+        "voice_audio_frames", "voice_audio_bytes", "voice_audio_timeouts",
+        "voice_nonempty_results", "voice_commands_matched",
+        "voice_commands_dispatched", "voice_direct_responses_started",
+        "voice_ocr_triggers", "voice_scene_triggers", "voice_recovery_count",
+        "speech_drop_count", "speech_cleared_count",
+    ):
+        if hasattr(mod, name):
+            setattr(mod, name, 0)
+    for name in ("voice_listener_heartbeat", "voice_last_audio_monotonic",
+                 "voice_last_processed_monotonic", "voice_last_recovery_monotonic"):
+        if hasattr(mod, name):
+            setattr(mod, name, 0.0)
+    if hasattr(mod, "voice_listener_stage"):
+        mod.voice_listener_stage = "stopped"
+    if hasattr(mod, "_set_voice_listener_source"):
+        mod._set_voice_listener_source(None, None)
     if hasattr(mod, "clear_waiting_speech"):
         mod.clear_waiting_speech()
     with mod.tof_state_lock:

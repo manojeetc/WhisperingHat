@@ -6,8 +6,8 @@ This document separates three things that were getting mixed together:
 2. **Published third-party measurements** (sources cited; not our hardware).
 3. **Still unverified on our Pi** (what to run and what to look for).
 
-The working baseline before these changes is commit `40b17d4`
-(`Add voice-triggered text reading and scene descriptions`). The default
+The working baseline before the current uncommitted changes is commit `fd76cda`
+(`Fix voice command routing and dedupe unknown-obstacle alerts`). The default
 runtime behavior after these changes is still YOLO11n at `imgsz=320`, the same
 `PROCESS_EVERY_N_FRAMES=3`, the same Vosk model, and the same TTS pipeline.
 Heavier models and new diagnostics are opt-in.
@@ -59,6 +59,65 @@ deliberate tradeoff: a one-cell return is too weak to distinguish a small real
 object from the 0.05 m false readings in the log. If the mounted sensor shows
 that a real small obstacle can only ever fill one cell, lower it to 1 and rely
 on the stabilization/smoothing window, then re-run the four alert tests.
+
+### 1.1.1 Why a visible chair/box still became “unknown obstacle”
+
+The generic warning was not only a YOLO-vocabulary problem. A known detection
+only suppressed the generic warning when its box received a **ToF cell match**
+(`distance_source == "tof"`). If the chair/box was below the calibrated ToF
+overlap, or outside its cells, the known detection had no ToF match and the
+generic path warning could still win. Close/low objects are the common case:
+their box can sit below the overlap rectangle even though the camera sees them.
+
+What changed:
+
+- `tof_distance_for_box(..., diagnostics=...)` now records why a match failed:
+  `box_outside_overlap_horizontal`, `box_outside_overlap_vertical`,
+  `no_valid_cells`, `tof_not_fresh`, or `matched`.
+- `TOF_BOX_CLAMP_LOW_OBJECTS` is an opt-in fallback
+  (`WHISPER_HAT_TOF_CLAMP_LOW=1`). It clamps a box whose sampled lower part is
+  just below the overlap to the bottom ToF row instead of dropping the match,
+  and logs `matched_below_overlap_clamped`. It is **off by default**: the
+  bottom ToF row may see the floor beyond the object, so enable it only if the
+  association log shows the object really is in that row.
+- The main loop tracks the nearest known object in the path from **both** ToF
+  and camera distance. `unknown_is_separate_from_known()` only keeps the generic
+  warning when no known object is close enough to explain the depth reading.
+- Static-obstacle speech now names the class (`chair close in path`) instead of
+  saying only `obstacle close in path`. The generic wording remains when no
+  confident label exists.
+
+Opt-in evidence line (one per class per second):
+
+```bash
+WHISPER_HAT_ASSOCIATION_DEBUG=1 python whisper.py
+```
+
+It prints the camera class/confidence/box/foot point, whether the foot point is
+in the walking corridor, the ToF match distance and reason, sampled rows/cols,
+and the visual/ToF source. That separates these cases:
+
+| Association line | Meaning |
+|---|---|
+| `source=tof reason=matched` | Camera box and depth agree; class name should win. |
+| `reason=box_outside_overlap_vertical` | Low/close box was outside the calibrated overlap; check the new clamp. |
+| `reason=box_outside_overlap_horizontal` | Object is outside the ToF field of view; the camera may still need a visual distance fallback. |
+| `reason=no_valid_cells` | ToF saw the box region but returned no valid ranges; check mounting/status. |
+| no association line for the object | YOLO did not detect it above `CONFIDENCE`; this is a model/vocabulary or framing problem. |
+
+The repo-side regression tests simulate a chair box over close ToF cells, a low
+box below the overlap, and the generic-warning arbitration. They do not prove
+the real camera sees the chair. The Pi run must show either an association line
+or a missing detection.
+
+The checked-in `whisper_hat_tof_log.csv` is consistent with both failure modes:
+it contains 109 generic alerts but only 11 chair alerts. Several chair alerts
+were within five seconds of a generic alert whose distance was different
+(for example, chair at 1.44 m and generic at 0.88 m, or chair at 2.40 m and
+generic at 1.15 m). That can mean the chair association was dropped, or that a
+second closer object was genuinely present. The new association line is needed
+to tell those apart; do not assume every nearby chair/generic pair is one
+object.
 
 ### 1.2 Voice commands not reliably reaching OCR
 
@@ -123,6 +182,54 @@ separate acoustic overlap from a stopped listening loop.
 
 Do not silently disable commands during frequent alerts. The cooldown is
 opt-in and time-limited; if it is enabled, the log shows each wait.
+
+### 1.4 Mid-session listening dropout and watchdog
+
+The supplied Pi log showed the process and ToF loop still running after the
+last voice line, so this is not a whole-process crash. The remaining candidates
+are a blocked capture read, a dead listener worker, stale playback suppression,
+or a speech queue that keeps dropping. The log did not contain enough
+per-stage audio/Vosk/queue evidence to choose between them.
+
+What changed (opt-in diagnostics, baseline behavior otherwise):
+
+- The listener now records a heartbeat at every real stage: `opening`,
+  `opened`, `calibrating`, `listening`, `processing`, `error`, `reopening`.
+- A watchdog runs every `VOICE_WATCHDOG_INTERVAL_SECONDS` (1 s). It recovers
+  **only** when the worker thread is dead or a stage heartbeat is older than
+  `VOICE_WATCHDOG_STALE_SECONDS` (12 s). Normal silence is not a failure: the
+  1 s `listen()` timeout refreshes the heartbeat.
+- Recovery closes/stops the current PyAudio stream so a blocked native read can
+  return, then lets the worker reopen the microphone. Retries are rate-limited
+  by `VOICE_RECOVERY_MIN_INTERVAL_SECONDS` (30 s) and the skip reason is logged.
+- Stale playback suppression is cleared only when `speech_active_event` has
+  been set for more than `VOICE_STALE_PLAYBACK_SECONDS` (25 s) **and** the
+  playback process is gone or finished. A genuinely playing warning is not
+  cleared.
+- Session counters separate `vosk_nonempty` (heard), `matched` (command
+  grammar), `dispatched` (routed to OCR/scene/detection), and
+  `answered_aloud` (a command-origin TTS utterance actually started). Queue
+  drops and queue clears are counted separately.
+- `print_voice_summary()` always prints those counters at shutdown. With
+  `WHISPER_HAT_VOICE_STATUS=1` it also prints a status line every 30 s.
+  The watchdog can be disabled for an A/B run with
+  `WHISPER_HAT_VOICE_WATCHDOG=0`.
+- `detection off` clears detection state and interrupts speech, but it does
+  **not** set `voice_control_stop_event`; the listener stays alive so
+  `detection on` can be recognized again. The regression test asserts this.
+
+Diagnostic command:
+
+```bash
+WHISPER_HAT_VOICE_DEBUG=1 WHISPER_HAT_VOICE_STATUS=1 WHISPER_HAT_LATENCY_DEBUG=1 python whisper.py 2>&1 | tee /tmp/whisper-voice.log
+```
+
+The new `playback_suppression_start` / `playback_suppression_clear` events,
+`listen_timeout`, `audio_captured`, `vosk_result`, `command_*`, `speech_*`, and
+the `[voice status]` line should identify the exact stage that stops. Do not
+conclude that TTS feedback is the cause until the log shows
+`vosk_result final="" tts_overlap=True`; if it does, compare audible vs.
+physically muted speaker while software playback still runs.
 
 ## 2. Published vision benchmarks vs. our device
 
@@ -228,6 +335,54 @@ never use its output as the source of urgent obstacle alerts.
 OCR remains a separate path (`read this` → Tesseract → spoken text) and is not
 mixed with scene description.
 
+### 2.4 Implemented open-vocabulary prototype
+
+The default remains YOLO11n/COCO. A YOLOE candidate is wired behind an explicit
+flag:
+
+```bash
+# Fixed prompt list, first run may download/build CLIP text embeddings
+WHISPER_HAT_OPEN_VOCAB=1 WHISPER_HAT_OPEN_VOCAB_MODEL=yoloe-11s-seg.pt python whisper.py
+```
+
+The default prompt list is intentionally small and obstacle-oriented:
+`chair`, `stool`, `bench`, `cardboard box`, `box`, `package`, `bag`,
+`backpack`, `handbag`, `suitcase`, `trash can`, `bin`, `basket`,
+`laundry basket`, `shopping cart`, `cart`, `shoe`, `shoes`, `table`, `desk`,
+`door`, `bucket`, `cooler`, `crate`, `traffic cone`, `stroller`, `walker`,
+`vacuum cleaner`, `fan`, `heater`, `plant`, `pet bowl`, `cable`, `toy`.
+
+Override with a comma-separated list:
+
+```bash
+WHISPER_HAT_OPEN_VOCAB=1 WHISPER_HAT_OPEN_VOCAB_CLASSES='chair,stool,box,cardboard box,laundry basket,trash can,bin,basket,cart,shoe' python whisper.py
+```
+
+The opt-in model runs continuously at `WHISPER_HAT_OPEN_VOCAB_IMG_SIZE`
+(defaults to `IMG_SIZE`) and uses the same `PROCESS_EVERY_N_FRAMES` schedule.
+`load_detection_model()` removes the COCO ID filter for this model, because
+YOLOE class IDs are not COCO IDs. `STATIC_OBSTACLE_CLASSES` includes the prompt
+names so they get obstacle risk rather than passive-object risk.
+
+For an offline Pi deployment, bake the prompt classes into an export once on a
+development machine (with network access) and point at the export. The exact
+export support depends on the installed ultralytics version; verify the file
+loads before copying it to the Pi:
+
+```bash
+python -c "from ultralytics import YOLOE; names=['chair','stool','box','cardboard box','laundry basket','trash can','bin','basket','cart','shoe']; m=YOLOE('yoloe-11s-seg.pt'); m.set_classes(names, m.get_text_pe(names)); m.export(format='onnx', imgsz=320)"
+```
+
+Then set `WHISPER_HAT_OPEN_VOCAB_MODEL` to the exported file and, if the export
+has baked names, `WHISPER_HAT_OPEN_VOCAB_PROMPT_FREE=1`. Do not assume an export
+is faster on the Pi; measure it with the same scenes.
+
+If continuous YOLOE does not meet the warning-latency budget, the safe fallback
+is to keep YOLO11n for urgent alerts and run the broad model only for an
+explicit “what’s ahead?” request. That on-demand path is not enabled by
+default; benchmark continuous YOLOE first and record the latency before adding
+it to the alert loop.
+
 ## 3. What to run on the Pi
 
 ### 3.1 Baseline and rollback
@@ -243,7 +398,7 @@ python -m pytest -q
 To compare with the pre-change baseline without losing the current work:
 
 ```bash
-git switch -c baseline-40b17d4 40b17d4
+git switch -c baseline-fd76cda fd76cda
 # run the same commands, then return:
 git switch main
 ```
@@ -343,7 +498,29 @@ Also record `valid` and `spread`. A high spread with a stable median is usually
 a noisy/mis-mounted sensor; a stable high-`valid` close reading is more likely
 a real obstacle. Do not lower thresholds just to silence the demo.
 
-### 3.4 Reproducible vision benchmark
+### 3.4 Controlled camera/ToF association test
+
+Run with the association log and place each object at roughly 0.5 m, 1.0 m,
+and 1.5 m in the walking path:
+
+```bash
+WHISPER_HAT_ASSOCIATION_DEBUG=1 WHISPER_HAT_UNKNOWN_DEBUG=1 WHISPER_HAT_LATENCY_DEBUG=1 python whisper.py 2>&1 | tee /tmp/whisper-association.log
+```
+
+Objects, in this order: chair, cardboard box, laundry basket, trash can, low
+stool. For each distance, record:
+
+1. whether an `[association]` line appears at all (camera detection);
+2. its `class`, `conf`, `foot`, `in_path`, `tof`, `reason`, and `source`;
+3. the spoken message and whether it named the object or stayed generic;
+4. whether the object is visible in the preview at the bottom of the frame.
+
+If the camera sees the object but the association line is missing, the failure
+is YOLO/vocabulary or framing. If the association line exists but says
+`box_outside_overlap_*`, tune the mount/overlap or use the visual distance
+fallback. Do not tune the model until these are separated.
+
+### 3.5 Reproducible vision benchmark
 
 Capture a fixed scene set with the production camera settings:
 
@@ -359,7 +536,28 @@ done
 
 Use the same directory, `--imgsz`, and confidence for every candidate. Include
 hard lighting, the objects the current model misses, and a labeled validation
-set if you want mAP:
+set if you want mAP. A label file maps each image filename to one expected
+name or a list of acceptable aliases:
+
+```json
+{
+  "scene-01.jpg": {"expected": ["chair"], "tof_visible": true},
+  "scene-02.jpg": {"expected": ["cardboard box", "box"], "tof_visible": true},
+  "scene-03.jpg": {"expected": ["laundry basket", "basket"], "tof_visible": true},
+  "scene-04.jpg": {"expected": ["trash can", "bin"], "tof_visible": false}
+}
+```
+
+`tof_visible` records whether the ToF path warning fired for that scene (or
+whether the obstacle was present in the ToF region). Without it, a no-name
+result is reported as `generic_or_missed`; with it, the benchmark can separate
+`generic` (ToF saw it, model did not name it) from `missed` (neither the model
+nor ToF flagged it).
+
+`--labels` adds separate `correct`, `wrong`, `generic`, `missed`, and
+`generic_or_missed` counts. The per-image detail records exactly which expected
+aliases and detected names were present, so the outcomes can be audited rather
+than inferred from an aggregate.
 
 ```bash
 python tests/bench_pi.py \
@@ -367,7 +565,23 @@ python tests/bench_pi.py \
   --images bench/scenes \
   --imgsz 320 --conf 0.40 --loops 10 \
   --val-data /path/to/labeled-scenes.yaml \
+  --labels bench/labels.json \
   --json-out bench/results.json
+
+# Open-vocabulary candidate on the same scenes. Continuous YOLOE first:
+python tests/bench_pi.py \
+  --open-vocab --models yoloe-11s-seg.pt \
+  --images bench/scenes --imgsz 320 --conf 0.40 --loops 5 \
+  --labels bench/labels.json \
+  --json-out bench/yoloe.json
+
+# Prompt-free/exported model with baked class names:
+python tests/bench_pi.py \
+  --open-vocab --open-vocab-prompt-free \
+  --models /path/to/yoloe-export.onnx \
+  --images bench/scenes --imgsz 320 --loops 5 \
+  --labels bench/labels.json \
+  --json-out bench/yoloe-export.json
 
 # OCR and TTS latency on the same frames/device:
 python tests/bench_pi.py \
@@ -393,9 +607,13 @@ or with the official 5 A supply and the active cooler; record the power mode.
 For end-to-end hazard/command latencies, the app logs:
 
 ```text
-[latency] hazard_to_tts_start=...ms
-[latency] command_to_tts_start=...ms
+[latency] hazard_to_tts_start=...ms message='...'
+[latency] command_to_tts_start=...ms message='...'
 ```
+
+The app log parser now reports `hazard_named` and `hazard_generic` separately
+by looking for `unknown obstacle` in that message, in addition to the combined
+`hazard` sample.
 
 Collect them from the Pi log and report median and p95 per condition. Pass the
 same log to `tests/bench_pi.py --app-log /tmp/whisper-voice.log` to include the
@@ -403,6 +621,48 @@ median/p95 in the JSON. The hazard timer starts when the camera frame is read;
 the command timer starts when the recognized command is routed to OCR/scene
 handling. They do not include the time from the user’s first spoken phoneme to
 Vosk’s final result.
+
+### 3.6 Fifteen-minute persistence and vocabulary run
+
+Run the production model first, then repeat only the obstacle cases with YOLOE.
+Keep voice listening and TTS active for every run so the test does not hide a
+voice regression.
+
+```bash
+WHISPER_HAT_VOICE_DEBUG=1 WHISPER_HAT_VOICE_STATUS=1 WHISPER_HAT_LATENCY_DEBUG=1 WHISPER_HAT_ASSOCIATION_DEBUG=1 WHISPER_HAT_UNKNOWN_DEBUG=1 python whisper.py 2>&1 | tee /tmp/whisper-15min.log
+```
+
+At the start, midway (about 7 minutes), and near the end (about 14 minutes),
+say each of these twice: `read this`, `read that`, `detection off`,
+`detection on`. Between them, trigger repeated alerts and interrupt one spoken
+response with a new STOP. The expected result is that `detection on` is still
+recognized after `detection off`, the listener summary shows a recent
+`last_audio_age_s`, and the watchdog logs a recovery only if the stream/worker
+actually failed.
+
+At shutdown, copy the final line:
+
+```text
+[voice summary] audio_frames=... vosk_nonempty=... matched=... dispatched=... answered_aloud=... ...
+```
+
+Report these as separate measurements, not one “success” number:
+
+- **recognized**: `vosk_nonempty`, plus how many were the expected phrase;
+- **dispatched**: `matched` / `dispatched` (OCR, scene, or detection command);
+- **answered aloud**: `answered_aloud` (TTS actually started);
+- **latency**: median and p95 of `command_to_tts_start` for successful
+  attempts, from `WHISPER_HAT_LATENCY_DEBUG=1` logs;
+- **warning latency**: median and p95 of `hazard_to_tts_start` for correct
+  obstacle names vs generic warnings;
+- **recoveries/drops**: `recoveries`, `speech_drops`, `speech_cleared`.
+
+For the obstacle/vocabulary matrix, use the five objects from 3.4 at three
+distances. For each candidate record `correct name`, `wrong name`, `generic`
+(no named detection; ToF warning only), or `missed` (no warning at all), plus
+whether the object was visible in the camera frame. Run YOLO11n, YOLO11s, and
+one YOLOE candidate on the same frames and conditions. Do not call the dropout
+fixed, or the vocabulary upgrade successful, until these Pi logs exist.
 
 ## 4. Recommendation based on the current evidence
 
@@ -415,10 +675,13 @@ Vosk’s final result.
   budget. Start at 384 with the opt-in profile, then try 320/416 on our scenes.
 - **YOLO11m is not recommended for real-time Pi 5 CPU** based on the published
   ~0.39–0.44 FPS at 640. It is an accuracy reference, not a wearable default.
-- **Do not replace YOLO11n with YOLOE for urgent alerts.** YOLOE adds
-  vocabulary, not same-class accuracy, and its zero-shot mAP is lower. Test it
-  only as an on-demand “what’s ahead?” experiment with frozen prompts and a
-  measured prompt-set cost.
+- **Do not replace YOLO11n with YOLOE for urgent alerts yet.** YOLOE is now
+  wired as an opt-in continuous candidate with a frozen obstacle prompt list,
+  but it adds vocabulary, not same-class accuracy, and its zero-shot mAP is
+  lower. Promote it only if the same-scene Pi run shows more correct names
+  without worsening median/p95 time-to-warning or the voice counters. If
+  continuous inference is too slow, keep YOLO11n for the first warning and run
+  the broad model only for an explicit “what’s ahead?” request.
 - **Keep scene description detections-based** unless an on-demand captioner
   benchmark shows a useful result within the latency/RAM budget. Never use a
   captioner as the urgent hazard source.
@@ -431,16 +694,23 @@ Vosk’s final result.
 - Actual microphone recognition rates for the new aliases on the Pi.
 - Whether TTS overlap is the dominant cause of missed commands, and whether the
   opt-in cooldown helps without hiding commands.
+- Whether the new watchdog actually recovers the mid-session dropout. The
+  repo-side tests cover dead-worker/stale-heartbeat/stale-playback logic only.
 - Actual sample rate the USB mic runs at (the log now reports it).
 - Real ToF noise/spread with the hat mounted, and whether a stationary obstacle
   still produces band changes after smoothing.
+- Whether close/low objects are visible in the real camera frame and whether
+  `matched_below_overlap_clamped` fires at the distances where the user saw
+  “unknown obstacle.”
 - YOLO11n/s/m accuracy and latency on our scenes at 320/384, under combined
   load, with our camera settings.
+- YOLOE-11s correct/wrong/generic/missed rates and median/p95 warning latency
+  on the Pi, including RAM and thermal behavior under combined voice/TTS load.
 - Whether NCNN/ONNX/OpenVINO exports improve our end-to-end latency after
   tracking and pre/post-processing are included.
 - Peak RAM and thermal throttling on the Pi 5 during a long combined run.
-- Any YOLOE Pi 5 latency or scene-captioner Pi 5 latency; no credible public
-  figures were found in this review.
+- Any scene-captioner Pi 5 latency; no credible public figures were found in
+  this review.
 
 Do not fill these gaps with estimates. Run the commands above and attach the
 JSON/log files to the commit or issue.

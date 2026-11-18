@@ -113,3 +113,81 @@ def test_resample_short_chunk_keeps_length(new):
 def test_fast_path_still_unchanged(new):
     raw = np.arange(-100, 100, dtype=np.int16).tobytes()
     assert new._convert_audio_to_16khz_mono_int16(_Audio(raw, 2, 16000)) == raw
+
+# --- Opt-in broad-vocabulary detector ------------------------------------
+def test_open_vocab_yoloe_sets_fixed_classes(new, monkeypatch):
+    record = {}
+
+    class FakeYOLOE:
+        def __init__(self, name):
+            record["name"] = name
+            self.names = {0: "chair", 1: "stool"}
+
+        def get_text_pe(self, names):
+            record["prompt"] = list(names)
+            return "embeddings"
+
+        def set_classes(self, names, embeddings):
+            record["classes"] = list(names)
+            record["embeddings"] = embeddings
+
+        def fuse(self, verbose=False):
+            record["fused"] = True
+
+    monkeypatch.setattr(new, "YOLOE", FakeYOLOE)
+    monkeypatch.setattr(new, "OPEN_VOCAB_ENABLED", True)
+    monkeypatch.setattr(new, "OPEN_VOCAB_MODEL", "yoloe-11s-seg.pt")
+    monkeypatch.setattr(new, "OPEN_VOCAB_PROMPT_FREE", False)
+    monkeypatch.setattr(new, "OPEN_VOCAB_CLASSES", ("chair", "stool"))
+    monkeypatch.setattr(new, "OPEN_VOCAB_IMG_SIZE", 384)
+    monkeypatch.setattr(new, "DETECTION_CLASSES", new.YOLO_CLASSES_TO_KEEP)
+    monkeypatch.setattr(new, "DETECTION_IMG_SIZE", 320)
+
+    model = new.load_detection_model()
+
+    assert isinstance(model, FakeYOLOE)
+    assert record["classes"] == ["chair", "stool"]
+    assert record["embeddings"] == "embeddings"
+    assert record["fused"] is True
+    assert new.DETECTION_CLASSES is None
+    assert new.DETECTION_IMG_SIZE == 384
+
+
+def test_open_vocab_prompt_free_does_not_set_classes(new, monkeypatch):
+    record = {}
+
+    class FakeYOLOE:
+        def __init__(self, name):
+            self.names = {0: "chair"}
+
+        def set_classes(self, *args):
+            record["set_classes"] = True
+
+        def fuse(self, verbose=False):
+            pass
+
+    monkeypatch.setattr(new, "YOLOE", FakeYOLOE)
+    monkeypatch.setattr(new, "OPEN_VOCAB_ENABLED", True)
+    monkeypatch.setattr(new, "OPEN_VOCAB_MODEL", "yoloe-11s-seg-pf.pt")
+    monkeypatch.setattr(new, "OPEN_VOCAB_PROMPT_FREE", False)
+
+    new.load_detection_model()
+
+    assert "set_classes" not in record
+
+
+def test_run_yolo_omits_coco_filter_for_open_vocab(new, monkeypatch):
+    calls = {}
+
+    class FakeModel:
+        def predict(self, frame, **kwargs):
+            calls.update(kwargs)
+            return "result"
+
+    monkeypatch.setattr(new, "USE_TRACKING", False)
+    monkeypatch.setattr(new, "DETECTION_CLASSES", None)
+    monkeypatch.setattr(new, "DETECTION_IMG_SIZE", 384)
+
+    assert new.run_yolo(FakeModel(), object()) == "result"
+    assert "classes" not in calls
+    assert calls["imgsz"] == 384

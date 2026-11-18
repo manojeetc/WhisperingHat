@@ -40,7 +40,11 @@ from collections import defaultdict, deque
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO, YOLOE
+except ImportError:
+    from ultralytics import YOLO
+    YOLOE = None
 
 try:
     import face_recognition
@@ -171,6 +175,40 @@ IMG_SIZE = int(
     os.environ.get(
         "WHISPER_HAT_IMG_SIZE", MODEL_PROFILES[MODEL_PROFILE]["img_size"]
     )
+)
+
+# Opt-in open-vocabulary detector for everyday obstacles the COCO baseline
+# cannot name. The baseline remains untouched unless this is explicitly on.
+#
+#   WHISPER_HAT_OPEN_VOCAB=1
+#   WHISPER_HAT_OPEN_VOCAB_MODEL=yoloe-11s-seg.pt
+#   WHISPER_HAT_OPEN_VOCAB_PROMPT_FREE=0
+#
+# For a Pi deployment, export the model once with these classes baked in and
+# point OPEN_VOCAB_MODEL at the exported file; otherwise the first run needs
+# the CLIP text encoder (network access) to build the text embeddings.
+OPEN_VOCAB_ENABLED = os.environ.get(
+    "WHISPER_HAT_OPEN_VOCAB", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+OPEN_VOCAB_MODEL = os.environ.get(
+    "WHISPER_HAT_OPEN_VOCAB_MODEL", "yoloe-11s-seg.pt"
+).strip()
+OPEN_VOCAB_PROMPT_FREE = os.environ.get(
+    "WHISPER_HAT_OPEN_VOCAB_PROMPT_FREE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+OPEN_VOCAB_IMG_SIZE = int(
+    os.environ.get("WHISPER_HAT_OPEN_VOCAB_IMG_SIZE", str(IMG_SIZE))
+)
+OPEN_VOCAB_CLASSES = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "WHISPER_HAT_OPEN_VOCAB_CLASSES",
+        "chair,stool,bench,cardboard box,box,package,bag,backpack,handbag,"
+        "suitcase,trash can,bin,basket,laundry basket,shopping cart,cart,"
+        "shoe,shoes,table,desk,door,bucket,cooler,crate,traffic cone,"
+        "stroller,walker,vacuum cleaner,fan,heater,plant,pet bowl,cable,toy",
+    ).split(",")
+    if name.strip()
 )
 
 # Tracking keeps separate memory for different people and objects.
@@ -385,6 +423,20 @@ TOF_BOX_X_INSET_FRACTION = 0.18
 TOF_BOX_Y_START_FRACTION = 0.22
 TOF_CELL_PADDING = 0
 
+# A close/low object can sit just below the calibrated ToF overlap rectangle
+# while still being visible to the camera. Clamp only the vertical sample to
+# the bottom ToF row so the camera detection can still claim that depth cell.
+TOF_BOX_CLAMP_LOW_OBJECTS = os.environ.get(
+    "WHISPER_HAT_TOF_CLAMP_LOW", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# Controlled-test logging: one line per class per interval showing the camera
+# box, corridor decision, ToF cells, and why a match was or was not made.
+TOF_ASSOCIATION_DEBUG = os.environ.get(
+    "WHISPER_HAT_ASSOCIATION_DEBUG", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+TOF_ASSOCIATION_DEBUG_INTERVAL_SECONDS = 1.0
+
 # Unknown-obstacle warnings are powerful but should only be enabled after the
 # ToF is rigidly mounted and its central path region is verified.
 TOF_UNKNOWN_OBSTACLE_ENABLED = True
@@ -491,6 +543,25 @@ VOICE_MIC_FALLBACK_RATES = (16000, 48000)
 VOICE_PLAYBACK_COOLDOWN_SECONDS = float(
     os.environ.get("WHISPER_HAT_VOICE_COOLDOWN", "0") or 0.0
 )
+
+# Listener watchdog. This recovers only when the audio stream stops making
+# progress or the worker thread dies, never just because the user is silent.
+# The normal listen timeout is 1 s and the phrase limit is 4 s; 12 s without a
+# heartbeat means a blocked stream read or a stuck native call.
+VOICE_WATCHDOG_ENABLED = os.environ.get(
+    "WHISPER_HAT_VOICE_WATCHDOG", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+VOICE_WATCHDOG_INTERVAL_SECONDS = 1.0
+VOICE_WATCHDOG_STALE_SECONDS = 12.0
+VOICE_RECOVERY_MIN_INTERVAL_SECONDS = 30.0
+VOICE_STALE_PLAYBACK_SECONDS = 25.0
+
+# Low-volume status line, disabled by default. It also appears when
+# VOICE_DEBUG_TIMING is on. Counts are cumulative for the session.
+VOICE_STATUS_LOG = os.environ.get(
+    "WHISPER_HAT_VOICE_STATUS", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+VOICE_STATUS_LOG_SECONDS = 30.0
 
 # Command aliases. The grammar includes only enabled aliases; normalization
 # removes punctuation and apostrophes, so "what's" and "whats" are equivalent.
@@ -658,6 +729,11 @@ YOLO_CLASSES_TO_KEEP = [
     56,  # chair
 ]
 
+# The COCO ID filter is replaced by None for a broad-vocabulary model whose
+# class IDs are not COCO IDs. load_detection_model() sets these.
+DETECTION_CLASSES = YOLO_CLASSES_TO_KEEP
+DETECTION_IMG_SIZE = IMG_SIZE
+
 
 # ============================================================
 # ALERT / MEMORY SETTINGS
@@ -719,8 +795,18 @@ USE_TRACK_ID_FOR_ALERT_KEY = False
 VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "bicycle"}
 PERSON_CLASSES = {"person"}
 ANIMAL_CLASSES = {"dog", "cat", "horse", "cow"}
-STATIC_OBSTACLE_CLASSES = {"bench", "chair", "backpack", "handbag", "suitcase"}
+STATIC_OBSTACLE_CLASSES = {
+    "bench", "chair", "stool", "box", "cardboard box", "package", "crate",
+    "bag", "backpack", "handbag", "suitcase", "trash can", "trashcan", "bin",
+    "garbage can", "basket", "laundry basket", "shopping cart", "cart",
+    "shoe", "shoes", "table", "desk", "door", "bucket", "cooler",
+    "traffic cone", "stroller", "walker", "vacuum cleaner", "fan", "heater",
+    "plant", "pet bowl", "cable", "toy", "luggage",
+}
 PASSIVE_SIGN_CLASSES = {"stop sign", "traffic light"}
+KNOWN_OBJECT_CLASSES = (
+    STATIC_OBSTACLE_CLASSES | PERSON_CLASSES | VEHICLE_CLASSES | ANIMAL_CLASSES
+)
 
 
 # ============================================================
@@ -798,6 +884,29 @@ detection_enabled_event = threading.Event()
 detection_enabled_event.set()
 voice_control_stop_event = threading.Event()
 voice_control_thread = None
+voice_control_lifecycle_lock = threading.Lock()
+voice_watchdog_thread = None
+voice_listener_source = None
+voice_listener_microphone = None
+voice_listener_source_lock = threading.Lock()
+voice_listener_heartbeat = 0.0
+voice_listener_stage = "stopped"
+voice_last_audio_monotonic = 0.0
+voice_last_processed_monotonic = 0.0
+voice_audio_frames = 0
+voice_audio_bytes = 0
+voice_audio_timeouts = 0
+voice_nonempty_results = 0
+voice_commands_matched = 0
+voice_commands_dispatched = 0
+voice_direct_responses_started = 0
+voice_ocr_triggers = 0
+voice_scene_triggers = 0
+voice_recovery_count = 0
+voice_last_recovery_monotonic = 0.0
+voice_last_status_log = 0.0
+speech_drop_count = 0
+speech_cleared_count = 0
 last_voice_command_time = 0.0
 scene_describe_event = threading.Event()
 last_scene_describe_time = 0.0
@@ -857,18 +966,113 @@ def _set_speech_active(active, message=None):
         speech_last_start_time = time.time()
         speech_active_message = message
         speech_active_event.set()
+        _voice_debug("playback_suppression_start", message=repr(message))
     else:
         speech_last_end_time = time.time()
         speech_active_message = None
         speech_active_event.clear()
+        _voice_debug("playback_suppression_clear")
 
 
-def _report_latency(origin_perf, label):
+def _voice_heartbeat(stage):
+    """Record real listener progress for the watchdog/status line."""
+    global voice_listener_heartbeat, voice_listener_stage
+    voice_listener_heartbeat = time.monotonic()
+    voice_listener_stage = stage
+    _log_voice_status(voice_listener_heartbeat)
+
+
+def _set_voice_listener_source(source, microphone=None):
+    global voice_listener_source, voice_listener_microphone
+    with voice_listener_source_lock:
+        voice_listener_source = source
+        voice_listener_microphone = microphone
+
+
+def print_voice_summary():
+    """Always print the session counters once, even when periodic logs are off."""
+    status = _voice_status_snapshot()
+    print(
+        "[voice summary] "
+        f"audio_frames={status['audio_frames']} "
+        f"timeouts={status['timeouts']} "
+        f"vosk_nonempty={status['vosk_nonempty']} "
+        f"matched={status['matched']} "
+        f"dispatched={status['dispatched']} "
+        f"answered_aloud={status['answered']} "
+        f"ocr_triggers={status['ocr_triggers']} "
+        f"scene_triggers={status['scene_triggers']} "
+        f"recoveries={status['recoveries']} "
+        f"last_audio_age_s={status['last_audio_age_s']} "
+        f"last_processed_age_s={status['last_processed_age_s']} "
+        f"speech_queue={status['speech_queue']} "
+        f"speech_drops={status['speech_drops']} "
+        f"speech_cleared={status['speech_cleared']} "
+        f"listener={status['thread']} stage={status['stage']}",
+        flush=True,
+    )
+
+
+def _voice_status_snapshot():
+    now = time.monotonic()
+    thread = voice_control_thread
+    heartbeat_age = (
+        None if voice_listener_heartbeat <= 0.0
+        else round(now - voice_listener_heartbeat, 2)
+    )
+    return {
+        "thread": "alive" if thread is not None and thread.is_alive() else "stopped",
+        "stage": voice_listener_stage,
+        "heartbeat_age_s": heartbeat_age,
+        "last_audio_age_s": (
+            None if voice_last_audio_monotonic <= 0.0
+            else round(now - voice_last_audio_monotonic, 2)
+        ),
+        "last_processed_age_s": (
+            None if voice_last_processed_monotonic <= 0.0
+            else round(now - voice_last_processed_monotonic, 2)
+        ),
+        "audio_frames": voice_audio_frames,
+        "audio_bytes": voice_audio_bytes,
+        "timeouts": voice_audio_timeouts,
+        "vosk_nonempty": voice_nonempty_results,
+        "matched": voice_commands_matched,
+        "dispatched": voice_commands_dispatched,
+        "answered": voice_direct_responses_started,
+        "ocr_triggers": voice_ocr_triggers,
+        "scene_triggers": voice_scene_triggers,
+        "speech_queue": speech_queue.qsize(),
+        "speech_drops": speech_drop_count,
+        "speech_cleared": speech_cleared_count,
+        "tts_active": speech_active_event.is_set(),
+        "recoveries": voice_recovery_count,
+    }
+
+
+def _log_voice_status(now=None, force=False):
+    """Low-volume session counters; opt-in via debug or status flag."""
+    global voice_last_status_log
+    if not (VOICE_DEBUG_TIMING or VOICE_STATUS_LOG):
+        return
+    now = time.monotonic() if now is None else now
+    if not force and now - voice_last_status_log < VOICE_STATUS_LOG_SECONDS:
+        return
+    voice_last_status_log = now
+    status = _voice_status_snapshot()
+    fields = " ".join(f"{key}={value}" for key, value in status.items())
+    print(f"[voice status {now_str()}] {fields}", flush=True)
+
+
+def _report_latency(origin_perf, label, message=None):
     """Opt-in end-to-end timing from a detected hazard/command to TTS start."""
     if not PRINT_LATENCY_DEBUG or origin_perf is None:
         return
     elapsed_ms = (time.perf_counter() - origin_perf) * 1000.0
-    print(f"[latency] {label}_to_tts_start={elapsed_ms:.1f}ms", flush=True)
+    suffix = "" if message is None else f" message={message!r}"
+    print(
+        f"[latency] {label}_to_tts_start={elapsed_ms:.1f}ms{suffix}",
+        flush=True,
+    )
 
 
 def clamp(value, low, high):
@@ -1328,18 +1532,27 @@ def _pixel_to_tof_cell(x, y, overlap):
     return int(clamp(col, 0, 7)), int(clamp(row, 0, 7))
 
 
-def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height, snapshot=None, overlap=None):
+def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height, snapshot=None, overlap=None,
+                         diagnostics=None):
     """Match a YOLO box to overlapping ToF cells.
 
     Returns None when the mount has not been calibrated, the box is outside the
-    overlap, or no fresh valid cells are available.
+    overlap, or no fresh valid cells are available. ``diagnostics`` is filled
+    with the reason and sampled rectangle for controlled association tests.
     """
+    def _diag(reason, **extra):
+        if diagnostics is not None:
+            diagnostics.clear()
+            diagnostics.update(reason=reason, **extra)
+
     if not (ENABLE_TOF and TOF_MOUNT_CALIBRATED):
+        _diag("tof_disabled_or_uncalibrated")
         return None
 
     if snapshot is None:
         snapshot = get_tof_snapshot()
     if not snapshot["fresh"]:
+        _diag("tof_not_fresh", age_seconds=snapshot.get("age_seconds"))
         return None
 
     if overlap is None:
@@ -1358,8 +1571,32 @@ def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height, snapshot=Non
     inter_top = max(sample_top, top)
     inter_bottom = min(sample_bottom, bottom)
 
-    if inter_right <= inter_left or inter_bottom <= inter_top:
+    reason = "matched"
+    if inter_right <= inter_left:
+        _diag(
+            "box_outside_overlap_horizontal",
+            sample_rect=(sample_left, sample_top, sample_right, sample_bottom),
+            overlap_rect=overlap,
+        )
         return None
+    if inter_bottom <= inter_top:
+        if (
+            TOF_BOX_CLAMP_LOW_OBJECTS
+            and sample_top >= bottom
+            and sample_bottom > bottom
+        ):
+            # The visible object is below the calibrated depth rectangle.
+            # Use the nearest (bottom) ToF row instead of dropping the match.
+            inter_top = max(top, bottom - 1.0)
+            inter_bottom = bottom
+            reason = "matched_below_overlap_clamped"
+        else:
+            _diag(
+                "box_outside_overlap_vertical",
+                sample_rect=(sample_left, sample_top, sample_right, sample_bottom),
+                overlap_rect=overlap,
+            )
+            return None
 
     col0, row0 = _pixel_to_tof_cell(inter_left, inter_top, overlap)
     col1, row1 = _pixel_to_tof_cell(inter_right - 1e-3, inter_bottom - 1e-3, overlap)
@@ -1372,9 +1609,25 @@ def tof_distance_for_box(x1, y1, x2, y2, frame_width, frame_height, snapshot=Non
     cells = snapshot["grid_mm"][row0:row1 + 1, col0:col1 + 1]
     valid = cells[np.isfinite(cells)]
     if valid.size < TOF_MIN_VALID_CELLS:
+        _diag(
+            "no_valid_cells",
+            row_range=(row0, row1),
+            col_range=(col0, col1),
+            valid_cells=int(valid.size),
+            sample_rect=(sample_left, sample_top, sample_right, sample_bottom),
+            overlap_rect=overlap,
+        )
         return None
 
     distance_mm = _fast_percentile_1d(valid, TOF_DISTANCE_PERCENTILE)
+    _diag(
+        reason,
+        row_range=(row0, row1),
+        col_range=(col0, col1),
+        valid_cells=int(valid.size),
+        sample_rect=(sample_left, sample_top, sample_right, sample_bottom),
+        overlap_rect=overlap,
+    )
     return {
         "distance_m": distance_mm / 1000.0,
         "valid_cells": int(valid.size),
@@ -1418,6 +1671,17 @@ def tof_unknown_path_distance(snapshot=None):
         "valid_cells": int(valid.size),
         "age_seconds": snapshot["age_seconds"],
     }
+
+
+def unknown_is_separate_from_known(
+    unknown_distance_m, nearest_tof_m, nearest_object_m,
+):
+    """True only when no known object can explain the generic depth reading."""
+    nearest_known_m = min(nearest_tof_m, nearest_object_m)
+    return (
+        unknown_distance_m + TOF_UNKNOWN_MATCH_TOLERANCE_M
+        < nearest_known_m
+    )
 
 
 def reset_unknown_obstacle_state():
@@ -1493,6 +1757,50 @@ def print_unknown_obstacle_debug(now, raw_m, smooth_m, valid_cells, spread_m,
         f"valid={valid_cells} spread={spread_m:.2f}m "
         f"nearest_known={nearest} risk={risk} action={action} "
         f"reason={reason}"
+    )
+
+
+last_association_debug_time = {}
+
+
+def maybe_print_association_debug(
+    class_name, conf, x1, y1, x2, y2, track_id, risk, reason, debug,
+):
+    """Log camera detection, ToF match, and association reason (opt-in).
+
+    This is the evidence needed to distinguish a missed camera detection from
+    a detection that the ToF association dropped. It is rate-limited per class
+    so a controlled chair/box/basket test stays readable.
+    """
+    if not TOF_ASSOCIATION_DEBUG:
+        return
+    now = time.time()
+    key = str(class_name)
+    if now - last_association_debug_time.get(key, 0.0) < TOF_ASSOCIATION_DEBUG_INTERVAL_SECONDS:
+        return
+    last_association_debug_time[key] = now
+
+    def _rect(value):
+        if not value:
+            return "none"
+        return "(" + ",".join(f"{float(part):.0f}" for part in value) + ")"
+
+    match_distance = debug.get("tof_match_distance_m")
+    match_text = "none" if match_distance is None else f"{match_distance:.2f}m"
+    print(
+        f"[association {now_str()}] class={class_name} conf={conf:.2f} "
+        f"track={track_id} box=({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) "
+        f"foot=({(x1 + x2) / 2.0:.0f},{y2:.0f}) "
+        f"in_path={debug.get('in_corridor')} pos={debug.get('corridor_position')} "
+        f"tof={match_text} reason={debug.get('tof_match_reason')} "
+        f"cells={debug.get('tof_valid_cells')} "
+        f"rows={debug.get('tof_row_range')} cols={debug.get('tof_col_range')} "
+        f"sample={_rect(debug.get('tof_sample_rect'))} "
+        f"overlap={_rect(debug.get('tof_overlap_rect'))} "
+        f"visual={debug.get('fake_distance_m'):.2f}m "
+        f"source={debug.get('distance_source')} "
+        f"risk={risk} alert={reason}",
+        flush=True,
     )
 
 
@@ -1863,6 +2171,7 @@ def score_risk(
         frame_height=frame_height,
     )
 
+    tof_match_diagnostics = {}
     tof_match = tof_distance_for_box(
         x1=x1,
         y1=y1,
@@ -1872,6 +2181,7 @@ def score_risk(
         frame_height=frame_height,
         snapshot=tof_snapshot,
         overlap=tof_overlap,
+        diagnostics=tof_match_diagnostics,
     )
 
     if tof_match is not None:
@@ -1987,16 +2297,16 @@ def score_risk(
         path_relevant = lower_half or very_low_object
         if path_relevant and distance_level == "very_close":
             risk = 3
-            reason = f"obstacle very close {direction}"
+            reason = f"{class_name} very close {direction}"
         elif path_relevant and distance_level == "close":
             risk = 2
-            reason = f"obstacle close {direction}"
+            reason = f"{class_name} close {direction}"
         elif path_relevant and approaching and distance_level == "medium":
             risk = 2
-            reason = f"obstacle getting closer {direction}"
+            reason = f"{class_name} getting closer {direction}"
         elif path_relevant and distance_level == "medium":
             risk = 1
-            reason = f"obstacle {direction}"
+            reason = f"{class_name} {direction}"
         elif distance_level == "very_close":
             risk = 1
             reason = f"{class_name} very close but not low {direction}"
@@ -2066,6 +2376,12 @@ def score_risk(
         "tof_age_seconds": None if tof_match is None else tof_match["age_seconds"],
         "tof_row_range": None if tof_match is None else tof_match["row_range"],
         "tof_col_range": None if tof_match is None else tof_match["col_range"],
+        "tof_match_reason": tof_match_diagnostics.get("reason"),
+        "tof_sample_rect": tof_match_diagnostics.get("sample_rect"),
+        "tof_overlap_rect": tof_match_diagnostics.get("overlap_rect"),
+        "tof_match_distance_m": (
+            None if tof_match is None else tof_match["distance_m"]
+        ),
         "approaching": approaching,
         "fast_approaching": fast_approaching,
         "area_growth": area_growth,
@@ -2348,10 +2664,12 @@ def _preferred_speech_temp_dir():
 def _speak_message_now(message, origin_perf=None, origin_label="speech"):
     """Run one TTS utterance with shared activity/timing instrumentation."""
     _set_speech_active(True, message)
-    _report_latency(origin_perf, origin_label)
+    _report_latency(origin_perf, origin_label, message=message)
     _voice_debug("tts_start", message=repr(message), protected=current_audio_protected)
     try:
-        _speak_message_now_inner(message)
+        _speak_message_now_inner(
+            message, count_command=(origin_label == "command"),
+        )
     finally:
         _voice_debug(
             "tts_end",
@@ -2361,9 +2679,9 @@ def _speak_message_now(message, origin_perf=None, origin_label="speech"):
         _set_speech_active(False)
 
 
-def _speak_message_now_inner(message):
+def _speak_message_now_inner(message, count_command=False):
     """Stream synthesized WAV audio directly into pw-play; fall back to tmpfs WAV if needed."""
-    global current_audio_process, _speech_missing_warned
+    global current_audio_process, _speech_missing_warned, voice_direct_responses_started
 
     speech_program, audio_player = _get_speech_binaries()
 
@@ -2373,6 +2691,9 @@ def _speak_message_now_inner(message):
             print(f"[speech error] {missing} was not found; speech is disabled.")
             _speech_missing_warned = True
         return
+
+    if count_command:
+        voice_direct_responses_started += 1
 
     wav_path = None
     synth_proc = None
@@ -2613,6 +2934,8 @@ def clear_waiting_speech(keep_protected=False):
             pass
 
     if dropped or kept:
+        global speech_cleared_count
+        speech_cleared_count += dropped
         _voice_debug(
             "speech_queue_cleared",
             dropped=dropped,
@@ -2692,6 +3015,8 @@ def play_alert_sound(risk, message, protected=False, urgent=None,
         ))
         return True
     except queue.Full:
+        global speech_drop_count
+        speech_drop_count += 1
         print("[speech warning] queue full, dropping this message.")
         _voice_debug("speech_dropped", reason="queue_full", message=repr(message))
         return False
@@ -2974,7 +3299,7 @@ def _compose_scene_description(objects):
 
 
 def _trigger_scene_description():
-    global last_scene_describe_time, scene_last_trigger_monotonic
+    global last_scene_describe_time, scene_last_trigger_monotonic, voice_scene_triggers
     if not ENABLE_SCENE_DESCRIBE:
         return False
     now = time.time()
@@ -2982,6 +3307,7 @@ def _trigger_scene_description():
         return True
     last_scene_describe_time = now
     scene_last_trigger_monotonic = time.monotonic()
+    voice_scene_triggers += 1
     scene_describe_event.set()
     return True
 
@@ -3053,7 +3379,7 @@ def _match_voice_command(text):
 
 
 def _apply_voice_command(text):
-    global last_voice_command_time
+    global last_voice_command_time, voice_commands_matched, voice_commands_dispatched
 
     command = _match_voice_command(text)
     if command is None:
@@ -3063,6 +3389,11 @@ def _apply_voice_command(text):
             tts_active=speech_active_event.is_set(),
         )
         return False
+
+    voice_commands_matched += 1
+    voice_commands_dispatched += 1
+    _voice_heartbeat("command_routed")
+    _log_voice_status(force=True)
 
     if ENABLE_SCENE_DESCRIBE and command == "what's there":
         _voice_debug("command_routed", command="scene_describe", text=repr(text))
@@ -3103,6 +3434,10 @@ def _voice_playback_cooldown_remaining():
 
 def _voice_control_worker():
     """Listen for offline Vosk commands with stage-by-stage diagnostics."""
+    global voice_audio_frames, voice_audio_bytes, voice_audio_timeouts
+    global voice_nonempty_results, voice_last_audio_monotonic
+    global voice_last_processed_monotonic
+
     if sr is None:
         print(
             "[voice control] SpeechRecognition is not installed. "
@@ -3148,13 +3483,18 @@ def _voice_control_worker():
     while not voice_control_stop_event.is_set():
         source = None
         microphone = None
+        _set_voice_listener_source(None, None)
+        _voice_heartbeat("opening")
         try:
             source, microphone, _opened_rate = _open_voice_source(mic_index)
+            _set_voice_listener_source(source, microphone)
+            _voice_heartbeat("opened")
             print(
                 "[voice control] Calibrating USB microphone for ambient noise...",
                 flush=True,
             )
             calibrate_started = time.monotonic()
+            _voice_heartbeat("calibrating")
             recognizer.adjust_for_ambient_noise(
                 source,
                 duration=VOICE_AMBIENT_CALIBRATION_SECONDS,
@@ -3171,10 +3511,12 @@ def _voice_control_worker():
                 '[voice control] OFFLINE Vosk ready. Say "detection off" or "detection on".',
                 flush=True,
             )
+            _voice_heartbeat("listening")
 
             # Keep the ALSA/PipeWire capture stream open across listen cycles
             # instead of reopening PyAudio (and duplicating stderr FDs) every second.
             while not voice_control_stop_event.is_set():
+                _voice_heartbeat("listening")
                 cooldown = _voice_playback_cooldown_remaining()
                 if cooldown > 0.0:
                     _voice_debug(
@@ -3200,6 +3542,8 @@ def _voice_control_worker():
                         phrase_time_limit=VOICE_PHRASE_TIME_LIMIT,
                     )
                 except sr.WaitTimeoutError:
+                    voice_audio_timeouts += 1
+                    _voice_heartbeat("listening")
                     _voice_debug(
                         "listen_timeout",
                         elapsed_s=round(time.monotonic() - listen_started, 3),
@@ -3208,6 +3552,10 @@ def _voice_control_worker():
                     continue
 
                 tts_overlap = speech_active_event.is_set()
+                voice_audio_frames += 1
+                voice_audio_bytes += len(audio.frame_data)
+                voice_last_audio_monotonic = time.monotonic()
+                _voice_heartbeat("processing")
                 duration_s = 0.0
                 try:
                     duration_s = len(audio.frame_data) / max(
@@ -3238,6 +3586,9 @@ def _voice_control_worker():
                 partial = json.loads(offline_recognizer.PartialResult())
                 result = json.loads(offline_recognizer.FinalResult())
                 text = _normalize_voice_command(result.get("text", ""))
+                voice_nonempty_results += int(bool(text))
+                voice_last_processed_monotonic = time.monotonic()
+                _voice_heartbeat("listening")
                 _voice_debug(
                     "vosk_result",
                     accepted=bool(accepted),
@@ -3266,6 +3617,7 @@ def _voice_control_worker():
         except Exception as error:
             if voice_control_stop_event.is_set():
                 break
+            _voice_heartbeat("error")
             print(f"[voice control] Offline microphone/recognition error: {error}")
             if source is None:
                 print(
@@ -3275,14 +3627,165 @@ def _voice_control_worker():
             _voice_debug("worker_error", error=f"{type(error).__name__}: {error}")
             voice_control_stop_event.wait(1.0)
         finally:
+            _set_voice_listener_source(None, None)
             if microphone is not None:
                 try:
                     with suppress_audio_stderr():
                         microphone.__exit__(None, None, None)
                 except Exception:
                     pass
+            _voice_heartbeat(
+                "stopped" if voice_control_stop_event.is_set() else "reopening"
+            )
             _voice_debug("mic_closed", source_open=source is not None)
 
+
+
+def _force_unblock_voice_stream():
+    """Close the current capture stream so a blocked native read can return."""
+    with voice_listener_source_lock:
+        source = voice_listener_source
+        microphone = voice_listener_microphone
+
+    if source is None and microphone is None:
+        _voice_debug("recovery_skipped", reason="no_listener_source")
+        return False
+
+    stream = getattr(source, "stream", None)
+    closed = False
+    if stream is not None:
+        for method_name in ("stop_stream", "close"):
+            method = getattr(stream, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method()
+                closed = True
+            except Exception as error:
+                _voice_debug(
+                    "recovery_stream_error",
+                    method=method_name,
+                    error=f"{type(error).__name__}: {error}",
+                )
+
+    if microphone is not None:
+        try:
+            with suppress_audio_stderr():
+                microphone.__exit__(None, None, None)
+            closed = True
+        except Exception as error:
+            _voice_debug(
+                "recovery_mic_error",
+                error=f"{type(error).__name__}: {error}",
+            )
+    return closed
+
+
+def _voice_watchdog_check(now=None):
+    """Recover a dead worker or a stream that stopped making progress.
+
+    Silence is not a failure: the normal 1 s listen timeout updates the
+    heartbeat. Recovery only runs when a real stage heartbeat is stale or the
+    worker thread is no longer alive. Retries are rate-limited.
+    """
+    global voice_recovery_count, voice_last_recovery_monotonic
+    global current_audio_protected
+
+    if not VOICE_WATCHDOG_ENABLED or voice_control_stop_event.is_set():
+        return False
+
+    now = time.monotonic() if now is None else now
+    thread = voice_control_thread
+    if thread is None:
+        return False
+
+    if not thread.is_alive():
+        if now - voice_last_recovery_monotonic < VOICE_RECOVERY_MIN_INTERVAL_SECONDS:
+            _voice_debug(
+                "recovery_rate_limited",
+                reason="worker_not_alive",
+                remaining_s=round(
+                    VOICE_RECOVERY_MIN_INTERVAL_SECONDS
+                    - (now - voice_last_recovery_monotonic),
+                    1,
+                ),
+            )
+            return False
+        if voice_control_stop_event.is_set():
+            return False
+        print(
+            "[voice watchdog] worker thread is not alive; restarting listener.",
+            flush=True,
+        )
+        voice_last_recovery_monotonic = now
+        voice_recovery_count += 1
+        _voice_heartbeat("restarting")
+        start_voice_control(start_watchdog=False)
+        return True
+
+    active_stages = {
+        "opening", "opened", "calibrating", "listening", "processing",
+        "recovering", "reopening",
+    }
+    heartbeat_age = now - voice_listener_heartbeat
+    if voice_listener_stage in active_stages and heartbeat_age > VOICE_WATCHDOG_STALE_SECONDS:
+        if now - voice_last_recovery_monotonic < VOICE_RECOVERY_MIN_INTERVAL_SECONDS:
+            _voice_debug(
+                "recovery_rate_limited",
+                reason="stale_stream",
+                stage=voice_listener_stage,
+                age_s=round(heartbeat_age, 1),
+                remaining_s=round(
+                    VOICE_RECOVERY_MIN_INTERVAL_SECONDS
+                    - (now - voice_last_recovery_monotonic),
+                    1,
+                ),
+            )
+            return False
+
+        print(
+            "[voice watchdog] no listener progress for "
+            f"{heartbeat_age:.1f}s at stage={voice_listener_stage}; "
+            "closing the capture stream to unblock the read.",
+            flush=True,
+        )
+        voice_last_recovery_monotonic = now
+        voice_recovery_count += 1
+        _voice_heartbeat("recovering")
+        _force_unblock_voice_stream()
+        return True
+
+    # A process can exit without the wrapper clearing the event if a native
+    # call is interrupted. Do not clear a genuinely active playback.
+    if speech_active_event.is_set() and speech_last_start_time > 0.0:
+        playback_age = time.time() - speech_last_start_time
+        process = current_audio_process
+        if playback_age > VOICE_STALE_PLAYBACK_SECONDS and (
+            process is None or process.poll() is not None
+        ):
+            print(
+                "[voice watchdog] clearing stale playback suppression "
+                f"after {playback_age:.1f}s.",
+                flush=True,
+            )
+            current_audio_protected = False
+            _set_speech_active(False)
+            return True
+
+    return False
+
+
+def _voice_watchdog_worker():
+    """Run the listener watchdog until voice control is stopped."""
+    while not voice_control_stop_event.is_set():
+        try:
+            _voice_watchdog_check()
+        except Exception as error:
+            print(
+                f"[voice watchdog] check error: {type(error).__name__}: {error}",
+                flush=True,
+            )
+        voice_control_stop_event.wait(VOICE_WATCHDOG_INTERVAL_SECONDS)
 
 
 def _voice_control_worker_safe():
@@ -3296,38 +3799,53 @@ def _voice_control_worker_safe():
         )
 
 
-def start_voice_control():
-    global voice_control_thread
+def start_voice_control(start_watchdog=True):
+    global voice_control_thread, voice_watchdog_thread
 
     if not ENABLE_VOICE_CONTROL:
         print("[voice control] Disabled in settings.", flush=True)
         return
 
-    if voice_control_thread is not None and voice_control_thread.is_alive():
-        print("[voice control] Worker is already running.", flush=True)
-        return
+    with voice_control_lifecycle_lock:
+        if voice_control_thread is not None and voice_control_thread.is_alive():
+            print("[voice control] Worker is already running.", flush=True)
+            return
 
-    # Print from the MAIN thread before launching the worker. This guarantees
-    # visible confirmation that the voice startup path was reached.
-    print(
-        f"[voice control] Starting USB voice control on device "
-        f"{VOICE_MIC_DEVICE_INDEX} at {VOICE_MIC_SAMPLE_RATE} Hz...",
-        flush=True,
-    )
+        # Print from the MAIN thread before launching the worker. This guarantees
+        # visible confirmation that the voice startup path was reached.
+        print(
+            f"[voice control] Starting USB voice control on device "
+            f"{VOICE_MIC_DEVICE_INDEX} at {VOICE_MIC_SAMPLE_RATE} Hz...",
+            flush=True,
+        )
 
-    voice_control_stop_event.clear()
-    voice_control_thread = threading.Thread(
-        target=_voice_control_worker_safe,
-        name="whisper-hat-voice-control",
-        daemon=True,
-    )
-    voice_control_thread.start()
+        voice_control_stop_event.clear()
+        voice_control_thread = threading.Thread(
+            target=_voice_control_worker_safe,
+            name="whisper-hat-voice-control",
+            daemon=True,
+        )
+        voice_control_thread.start()
+
+        if start_watchdog and (
+            voice_watchdog_thread is None or not voice_watchdog_thread.is_alive()
+        ):
+            voice_watchdog_thread = threading.Thread(
+                target=_voice_watchdog_worker,
+                name="whisper-hat-voice-watchdog",
+                daemon=True,
+            )
+            voice_watchdog_thread.start()
 
 
 def stop_voice_control():
+    global voice_listener_stage
     voice_control_stop_event.set()
     if voice_control_thread is not None and voice_control_thread.is_alive():
         voice_control_thread.join(timeout=3.0)
+    if voice_watchdog_thread is not None and voice_watchdog_thread.is_alive():
+        voice_watchdog_thread.join(timeout=2.0)
+    voice_listener_stage = "stopped"
 
 
 # ============================================================
@@ -3495,7 +4013,7 @@ def _perform_ocr_read(source):
 
 def _trigger_ocr_reading():
     """Signal the OCR worker, debounced so one utterance reads one snapshot."""
-    global last_ocr_trigger_time, ocr_last_trigger_monotonic
+    global last_ocr_trigger_time, ocr_last_trigger_monotonic, voice_ocr_triggers
     if not ENABLE_OCR_READING:
         _voice_debug("ocr_trigger_ignored", reason="disabled")
         return False
@@ -3508,6 +4026,7 @@ def _trigger_ocr_reading():
         return True
     last_ocr_trigger_time = now
     ocr_last_trigger_monotonic = time.monotonic()
+    voice_ocr_triggers += 1
     ocr_trigger_event.set()
     _voice_debug(
         "ocr_triggered",
@@ -4634,26 +5153,19 @@ def run_tof_console_test():
 # ============================================================
 
 def run_yolo(model, frame):
-    if USE_TRACKING:
-        return model.track(
-            frame,
-            persist=True,
-            tracker=TRACKER_NAME,
-            verbose=False,
-            conf=CONFIDENCE,
-            imgsz=IMG_SIZE,
-            device=DEVICE,
-            classes=YOLO_CLASSES_TO_KEEP,
-        )
+    kwargs = {
+        "verbose": False,
+        "conf": CONFIDENCE,
+        "imgsz": DETECTION_IMG_SIZE,
+        "device": DEVICE,
+    }
+    if DETECTION_CLASSES is not None:
+        kwargs["classes"] = DETECTION_CLASSES
 
-    return model.predict(
-        frame,
-        verbose=False,
-        conf=CONFIDENCE,
-        imgsz=IMG_SIZE,
-        device=DEVICE,
-        classes=YOLO_CLASSES_TO_KEEP,
-    )
+    if USE_TRACKING:
+        return model.track(frame, persist=True, tracker=TRACKER_NAME, **kwargs)
+
+    return model.predict(frame, **kwargs)
 
 
 def extract_detections(results, names):
@@ -4687,6 +5199,52 @@ def extract_detections(results, names):
     return detections
 
 
+def _load_open_vocab_model():
+    """Load the opt-in broad-vocabulary detector.
+
+    YOLOE with a fixed prompt list keeps inference offline after the text
+    embeddings are built/exported. A prompt-free or exported model loads with
+    plain YOLO and must already contain the baked class names.
+    """
+    model_path = Path(OPEN_VOCAB_MODEL)
+    prompt_free = OPEN_VOCAB_PROMPT_FREE or "-pf" in model_path.stem.lower()
+    use_yoloe = YOLOE is not None and model_path.suffix.lower() == ".pt"
+
+    if use_yoloe:
+        model = YOLOE(OPEN_VOCAB_MODEL)
+        if not prompt_free:
+            names = list(OPEN_VOCAB_CLASSES)
+            print(
+                f"[open-vocab] Building text embeddings for {len(names)} classes "
+                "(first run may need the CLIP text encoder)."
+            )
+            model.set_classes(names, model.get_text_pe(names))
+    else:
+        model = YOLO(OPEN_VOCAB_MODEL)
+        if use_yoloe is False and YOLOE is None and model_path.suffix.lower() == ".pt":
+            print(
+                "[open-vocab] ultralytics YOLOE is unavailable; loading the "
+                "checkpoint with YOLO. Install a YOLOE-capable ultralytics or "
+                "use an exported model with baked classes."
+            )
+
+    try:
+        model.fuse(verbose=False)
+    except (TypeError, AttributeError):
+        pass
+
+    names = getattr(model, "names", None)
+    if isinstance(names, dict):
+        names = list(names.values())
+    if names:
+        print(
+            f"[open-vocab] {OPEN_VOCAB_MODEL} -> {len(names)} classes: "
+            + ", ".join(str(name) for name in names[:40])
+            + (" ..." if len(names) > 40 else "")
+        )
+    return model
+
+
 def load_detection_model():
     """Load YOLO and fold BatchNorm into Conv2d for faster CPU inference.
 
@@ -4694,6 +5252,15 @@ def load_detection_model():
     fewer ops per frame. Non-PyTorch exports (e.g. the NCNN model named in
     MODEL_NAME's comment) are already fused and reject fuse(), so skip them.
     """
+    global DETECTION_CLASSES, DETECTION_IMG_SIZE
+
+    if OPEN_VOCAB_ENABLED:
+        DETECTION_CLASSES = None
+        DETECTION_IMG_SIZE = OPEN_VOCAB_IMG_SIZE
+        return _load_open_vocab_model()
+
+    DETECTION_CLASSES = YOLO_CLASSES_TO_KEEP
+    DETECTION_IMG_SIZE = IMG_SIZE
     model = YOLO(MODEL_NAME)
     try:
         model.fuse(verbose=False)
@@ -4719,8 +5286,13 @@ def main():
     )
     emotion_recognizer = EmotionRecognizer(EMOTION_MODEL_FILE)
 
-    print("Loading YOLO model...")
-    print(f"Model: {MODEL_NAME}")
+    if OPEN_VOCAB_ENABLED:
+        print("Loading opt-in open-vocabulary model...")
+        print(f"Model: {OPEN_VOCAB_MODEL}")
+        print(f"Open-vocabulary prompts: {', '.join(OPEN_VOCAB_CLASSES)}")
+    else:
+        print("Loading YOLO model...")
+        print(f"Model: {MODEL_NAME}")
     model = load_detection_model()
 
     print("Opening source...")
@@ -4820,6 +5392,7 @@ def main():
             best_distance_m = 999.0
             emotion_speech_candidates = []
             nearest_matched_tof_m = float("inf")
+            nearest_known_object_m = float("inf")
 
             # Take one ToF snapshot and overlap rectangle per frame and share
             # them across the summary, overlay, every box, and the unknown
@@ -4898,6 +5471,20 @@ def main():
                         nearest_matched_tof_m = min(
                             nearest_matched_tof_m,
                             debug.get("fake_distance_m", float("inf")),
+                        )
+                    if (
+                        debug.get("in_corridor")
+                        and class_name in KNOWN_OBJECT_CLASSES
+                    ):
+                        nearest_known_object_m = min(
+                            nearest_known_object_m,
+                            debug.get("fake_distance_m", float("inf")),
+                        )
+
+                    if detection_ran:
+                        maybe_print_association_debug(
+                            class_name, conf, x1, y1, x2, y2, track_id,
+                            risk, reason, debug,
                         )
 
                     debug["face_name"] = None
@@ -5043,9 +5630,17 @@ def main():
                 )
                 unknown_tof["raw_distance_m"] = raw_unknown_distance
                 unknown_tof["distance_m"] = unknown_distance
-                unknown_is_separate = (
-                    unknown_distance + TOF_UNKNOWN_MATCH_TOLERANCE_M
-                    < nearest_matched_tof_m
+                # A known detection can be associated by a ToF cell match or,
+                # when the box falls outside the calibrated overlap, by its
+                # camera/visual distance. Use the nearest of the two so a
+                # visible chair/box does not also produce "unknown obstacle".
+                nearest_known_m = min(
+                    nearest_matched_tof_m, nearest_known_object_m
+                )
+                unknown_is_separate = unknown_is_separate_from_known(
+                    unknown_distance,
+                    nearest_matched_tof_m,
+                    nearest_known_object_m,
                 )
                 if not unknown_is_separate:
                     print_unknown_obstacle_debug(
@@ -5054,7 +5649,7 @@ def main():
                         unknown_distance,
                         unknown_tof["valid_cells"],
                         unknown_tof.get("spread_m", 0.0),
-                        nearest_matched_tof_m,
+                        nearest_known_m,
                         0,
                         "matched a known detection",
                         "matched_known_object",
@@ -5133,10 +5728,16 @@ def main():
 
                     if message:
                         print(message)
+                        # Only a new/escalated/materially-closer STOP may
+                        # interrupt active speech. Notices/cautions queue at
+                        # their priority instead of killing pw-play every 0.5s.
                         urgent = bool(
-                            last_alert_decision.get("new")
-                            or last_alert_decision.get("escalated")
-                            or last_alert_decision.get("materially_closer")
+                            best_risk >= 3
+                            and (
+                                last_alert_decision.get("new")
+                                or last_alert_decision.get("escalated")
+                                or last_alert_decision.get("materially_closer")
+                            )
                         )
                         safety_message_queued = _play_safety_alert(
                             best_risk, message, urgent, origin_perf=frame_perf
@@ -5208,6 +5809,7 @@ def main():
     finally:
         source.release()
         stop_voice_control()
+        print_voice_summary()
         stop_ocr_reader()
         stop_tof_worker()
         stop_speech_worker()
