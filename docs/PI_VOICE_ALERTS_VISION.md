@@ -833,6 +833,88 @@ corrected input and compare recognized words against the page. Do this before
 tuning resolution, cropping, segmentation, or quality thresholds. The mirror
 correction is established; successful full-page reading still needs a Pi test.
 
+#### Capture-focus investigation after the unmirror fix
+
+The newer Pi dumps confirm that OCR unmirroring works, but the 1920x1440
+original is already blurry and OCR returned zero words. Investigate capture
+before changing resolution, cropping, OCR preprocessing, PSM, or the gate.
+The normal still path captures immediately after the mode switch; it neither
+waits for nor verifies autofocus. Picamera2's switch stops/configures/restarts
+the camera. Whether that resets lens position or AF state on this Pi needs
+metadata from actual exposures, not an assumption that preview focus carries
+over.
+
+`ocr_focus_probe.py` is a **standalone, opt-in Pi diagnostic**. It reuses the
+current camera configuration, newest-frame wrapper, unmirror/resize, Tesseract
+arguments, exact-stdin dump, and quality predicate. Normal `whisper.py` capture
+behavior is unchanged. **The probe does not run YOLO or obstacle alerts**.
+Its frame gaps measure capture availability without inference load; an app-load
+gap measurement is still required before adopting a focus wait as the default.
+
+Stop the boot service and any manual `whisper.py` process first. Before starting,
+hold the hat and **one complete centered page stationary under even lighting**,
+with the page filling most of the frame. Leave both fixed throughout the test:
+
+```bash
+cd ~/WhisperingHat
+git pull --ff-only
+WHISPER_HAT_OCR_QUALITY=1 WHISPER_HAT_OCR_MAX_WIDTH=1024 \
+  WHISPER_HAT_OCR_STILL_WIDTH=1920 WHISPER_HAT_OCR_STILL_HEIGHT=1440 \
+  .venv/bin/python -u ocr_focus_probe.py 2>&1 | tee /tmp/whisper-ocr-focus.log
+```
+
+The probe runs two captures and exits:
+
+1. **Immediate:** same delay=0 switch/capture/switch-back sequence as the
+   current still path. It uses Picamera2's arrays-plus-metadata variant to
+   associate focus metadata with the actual image exposure.
+2. **Settled:** waits for preview focus, switches to still mode, records the
+   **first still metadata before changing AF**, explicitly starts an AF cycle
+   in still mode, and captures the request reporting Focused after Scanning.
+   Preview is restored in `finally`, including on failure. The diagnostic
+   restores continuous AF on return to preview.
+
+AF has a six-second budget while camera frames are arriving. Missing metadata,
+failed focus, and timeout are logged explicitly; their saved image must **not**
+be interpreted as a successfully focused capture. The probe logs raw `AfState`
+(0 Idle, 1 Scanning, 2 Focused, 3 Failed), `LensPosition` in diopters, `AfMode`
+when supplied, exposure/gain, and sensor timestamp. Missing fields are null.
+It also logs preview/still configuration controls; these are requested settings,
+not proof of the effective AF mode. Match `preview-before-settled-switch` with
+`settled-first-still-before-trigger` to see whether switching changes focus.
+Compare preview-after metadata as well. Exposure changes can also contribute
+to blur; AF reporting Focused does not establish that the printed page is sharp.
+
+Four PNGs are saved in one private `/tmp/whisper-hat-focus-<id>/` directory
+(use the logged absolute path if the system temporary directory differs):
+`<id>-immediate-original.png`, `<id>-immediate-tesseract-input.png`,
+`<id>-settled-original.png`, and `<id>-settled-tesseract-input.png`, with the
+full `whisper-hat-focus-` prefix in every filename. Originals are untouched;
+inputs are the exact existing Tesseract stdin bytes. Images remain local and
+outside Git. This dedicated probe intentionally saves both pairs regardless
+of OCR rejection; the app's separate one-shot option still saves only one pair.
+
+Each attempt logs `capture_call_s` and `preview_frame_gap_s`. The latter uses
+the existing newest-frame bookkeeping from the last preview before the still
+through the first fresh preview after it, including autofocus time. The probe
+waits for that resumed frame so it cannot accidentally report the last
+attempt's gap. It logs recognized words/text and the unchanged gate's decision
+for both attempts, even when no words are found.
+
+From Windows PowerShell, replace the host and directory with the logged values:
+
+```powershell
+scp "PI_USER@PI_HOST:/tmp/whisper-hat-focus-<id>/*.png" "$env:USERPROFILE\Downloads\"
+scp "PI_USER@PI_HOST:/tmp/whisper-ocr-focus.log" "$env:USERPROFILE\Downloads\"
+```
+
+Compare actual printed lines and original-image sharpness first, then the
+recognized words. Report both gaps, AF outcomes, and lens-position changes.
+If waiting helps, repeat the gap measurement under the normal app workload
+before proposing a default wait. Until the Pi runs this probe, neither a focus
+reset nor the benefit/cost of waiting has been verified. Keep the unmirror and
+quality gate unchanged; microphone recovery remains a separate investigation.
+
 #### Broader OCR and interruption matrix (after image inspection)
 
 Use a real book page, not a synthetic screenshot. Run with the detection stream
