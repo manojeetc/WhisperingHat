@@ -13,6 +13,10 @@ helpers does not start the app. It never calls tracking, risk scoring, alert
 arbitration, speech, camera, microphone, OCR, or autofocus workers. Naming
 results have no connection to hazard warnings. No live files/settings change.
 
+The later live naming change is documented in `OBSTACLE_NAMING.md`. This probe's
+`baseline_live` pass still describes the unchanged tracking/risk/scene filter;
+the separate, unfiltered naming pass only runs after a ToF warning is approved.
+
 ## What currently produces an unknown warning
 
 The inspected baseline is `whisper.py` at `f21faf7`:

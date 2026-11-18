@@ -13,6 +13,7 @@ import sys
 import cv2
 import time
 import math
+import copy
 import subprocess
 import shutil
 import tempfile
@@ -436,6 +437,9 @@ TOF_ASSOCIATION_DEBUG = os.environ.get(
     "WHISPER_HAT_ASSOCIATION_DEBUG", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 TOF_ASSOCIATION_DEBUG_INTERVAL_SECONDS = 1.0
+ALERT_TRACE = os.environ.get("WHISPER_HAT_ALERT_TRACE", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 # Unknown-obstacle warnings are powerful but should only be enabled after the
 # ToF is rigidly mounted and its central path region is verified.
@@ -748,6 +752,8 @@ EMOTION_HISTORY_LENGTH = 5
 # 9 traffic light, 11 stop sign, 13 bench, 15 cat, 16 dog,
 # 17 horse, 19 cow, 24 backpack, 26 handbag, 28 suitcase, 56 chair
 
+# Preserve the existing tracking/risk/scene filter. Obstacle naming uses all
+# labels from a separate prediction of the same loaded weights after approval.
 YOLO_CLASSES_TO_KEEP = [
     0,   # person
     1,   # bicycle
@@ -5820,6 +5826,42 @@ def extract_detections(results, names):
     return detections
 
 
+def name_tof_obstacle(model, frame, distance_m, snapshot, overlap):
+    """Name an already-approved ToF warning; never score or suppress a hazard."""
+    results = model.predict(
+        frame, verbose=False, conf=CONFIDENCE, imgsz=DETECTION_IMG_SIZE,
+        device=DEVICE, classes=None, save=False,
+    )
+    height, width = frame.shape[:2]
+    best = None
+    for label, conf, x1, y1, x2, y2, _ in extract_detections(results, model.names):
+        inside, _ = corridor_geometry_for_point((x1 + x2) / 2, y2, width, height)
+        diagnostics = {}
+        match = tof_distance_for_box(
+            x1, y1, x2, y2, width, height, snapshot=snapshot,
+            overlap=overlap, diagnostics=diagnostics,
+        )
+        if match is not None:
+            candidate_m, source = match["distance_m"], "tof"
+        else:
+            candidate_m, source = raw_fake_distance_meters(label, x1, y1, x2, y2, width, height)
+        accepted = conf >= CONFIDENCE and inside and not unknown_is_separate_from_known(
+            distance_m, candidate_m, float("inf"),
+        )
+        if ALERT_TRACE:
+            print(
+                f"[obstacle naming] class={label} conf={conf:.2f} "
+                f"box=({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) in_path={inside} "
+                f"source={source} distance={candidate_m:.2f}m "
+                f"tof_reason={diagnostics.get('reason')} accepted={accepted}", flush=True,
+            )
+        if accepted:
+            candidate = (candidate_m, -conf, label)
+            if best is None or candidate < best:
+                best = candidate
+    return None if best is None else best[2]
+
+
 def _load_open_vocab_model():
     """Load the opt-in broad-vocabulary detector.
 
@@ -5915,6 +5957,13 @@ def main():
         print("Loading YOLO model...")
         print(f"Model: {MODEL_NAME}")
     model = load_detection_model()
+    try:
+        # Clone before ByteTrack callbacks/history exist. The naming-only pass
+        # cannot change tracking, risk, scene descriptions or alert memory.
+        obstacle_naming_model = copy.deepcopy(model)
+    except Exception as exc:
+        print(f"[obstacle naming] initialization failed; using fallback: {exc}", flush=True)
+        obstacle_naming_model = None
 
     print("Opening source...")
     source = open_source()
@@ -6027,6 +6076,8 @@ def main():
             if detection_enabled:
                 maybe_print_tof_summary(tof_snapshot)
 
+            # Display overlays below mutate frame; naming must see camera pixels.
+            naming_frame = frame.copy() if detection_enabled and SHOW_WINDOW else frame
             if SHOW_WINDOW:
                 draw_walking_corridor(frame)
                 if detection_enabled:
@@ -6097,6 +6148,8 @@ def main():
                         debug.get("in_corridor")
                         and class_name in KNOWN_OBJECT_CLASSES
                     ):
+                        # Existing hazard arbitration, not the naming pass.
+                        # Broadening this set here would suppress ToF warnings.
                         nearest_known_object_m = min(
                             nearest_known_object_m,
                             debug.get("fake_distance_m", float("inf")),
@@ -6339,13 +6392,34 @@ def main():
             if best_alert_key is not None:
                 print_alert_debug(best_risk, best_reason, best_debug)
 
-                if should_alert(
+                approved = should_alert(
                     best_alert_key,
                     best_risk,
                     best_reason,
                     distance_m=best_distance_m,
-                ):
-                    message = alert_text(best_risk, best_reason)
+                )
+                if ALERT_TRACE:
+                    print(
+                        f"[alert trace] key={best_alert_key} risk={best_risk} "
+                        f"distance={best_distance_m:.2f}m approved={approved} "
+                        f"decision={last_alert_decision.get('suppressed_by')} reason={best_reason}",
+                        flush=True,
+                    )
+                if approved:
+                    spoken_reason = best_reason
+                    if best_alert_key == "tof:unknown:in_path" and obstacle_naming_model is not None:
+                        try:
+                            label = name_tof_obstacle(
+                                obstacle_naming_model, naming_frame, best_distance_m,
+                                tof_snapshot, tof_overlap,
+                            )
+                            if label is not None:
+                                spoken_reason = best_reason.replace("unknown obstacle", label, 1)
+                        except Exception as exc:
+                            print(f"[obstacle naming] prediction failed; using fallback: {exc}", flush=True)
+                    message = alert_text(best_risk, spoken_reason)
+                    if ALERT_TRACE:
+                        print(f"[alert trace] spoken={message!r} hazard_reason={best_reason!r}", flush=True)
 
                     if message:
                         print(message)
