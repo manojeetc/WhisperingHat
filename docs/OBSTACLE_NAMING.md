@@ -3,7 +3,7 @@
 For capped exact-frame capture and the four-way offline comparison, see
 `YOLOE_PROBE.md`. The ambiguity experiment is offline only.
 
-An approved generic ToF warning can now use any label from the loaded YOLO11n
+An approved generic ToF warning can use any label from the loaded detector
 model. There is no class whitelist or known-name set in the naming pass, and no
 special case for bed. Labels come from `model.names` via `extract_detections()`.
 
@@ -13,7 +13,9 @@ first tracking call, the loaded/fused model is copied into an independent
 prediction-only model. Only after `should_alert()` approves a generic ToF
 warning does this copy predict with `classes=None`, the existing confidence,
 image size and device. It uses original camera pixels before display overlays.
-No model is downloaded or replaced for this feature; YOLOE is not enabled.
+The main detector now defaults to prompted `yoloe-11s-seg.pt`; its first load
+may download weights and the text encoder. `WHISPER_HAT_OPEN_VOCAB=0` restores
+the YOLO11n main detector. No separate naming worker was added.
 
 Candidates must pass the existing corridor geometry and distance-association
 rule (`unknown_is_separate_from_known()` with the existing .45 m tolerance).

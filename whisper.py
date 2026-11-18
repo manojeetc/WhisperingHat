@@ -131,7 +131,7 @@ CAMERA_VFLIP = True
 
 # In SSH/headless mode, leave this False.
 # On the Pi desktop or through VNC, change it to True to see the preview window.
-SHOW_WINDOW = True
+SHOW_WINDOW = os.environ.get("WHISPER_HAT_HEADLESS", "0").strip().lower() not in {"1", "true", "yes", "on"}
 
 # Pi 5 performance settings.
 # The baseline profile stays conservative. Heavier models are opt-in only.
@@ -145,9 +145,8 @@ LATEST_FRAME_WAIT_SECONDS = 1.5
 CONFIDENCE = 0.40
 DEVICE = "cpu"
 
-# Detection model profiles. The default is the existing YOLO11n baseline;
-# YOLO11s/YOLO11m stay behind an explicit environment flag so a Pi can always
-# be rolled back to the model that was benchmarked as the working baseline.
+# Detection model profiles used with WHISPER_HAT_OPEN_VOCAB=0.
+# YOLO11n remains the rollback profile; YOLO11s/YOLO11m require an explicit flag.
 #
 #   WHISPER_HAT_MODEL_PROFILE=baseline       yolo11n.pt @ 320 (default)
 #   WHISPER_HAT_MODEL_PROFILE=accuracy       yolo11s.pt @ 384 (opt-in)
@@ -178,8 +177,8 @@ IMG_SIZE = int(
     )
 )
 
-# Opt-in open-vocabulary detector for everyday obstacles the COCO baseline
-# cannot name. The baseline remains untouched unless this is explicitly on.
+# Prompted open-vocabulary detector by default. Set WHISPER_HAT_OPEN_VOCAB=0
+# to return to the YOLO11n baseline.
 #
 #   WHISPER_HAT_OPEN_VOCAB=1
 #   WHISPER_HAT_OPEN_VOCAB_MODEL=yoloe-11s-seg.pt
@@ -189,7 +188,7 @@ IMG_SIZE = int(
 # point OPEN_VOCAB_MODEL at the exported file; otherwise the first run needs
 # the CLIP text encoder (network access) to build the text embeddings.
 OPEN_VOCAB_ENABLED = os.environ.get(
-    "WHISPER_HAT_OPEN_VOCAB", "0"
+    "WHISPER_HAT_OPEN_VOCAB", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 OPEN_VOCAB_MODEL = os.environ.get(
     "WHISPER_HAT_OPEN_VOCAB_MODEL", "yoloe-11s-seg.pt"
@@ -204,10 +203,8 @@ OPEN_VOCAB_CLASSES = tuple(
     name.strip()
     for name in os.environ.get(
         "WHISPER_HAT_OPEN_VOCAB_CLASSES",
-        "chair,stool,bench,cardboard box,box,package,bag,backpack,handbag,"
-        "suitcase,trash can,bin,basket,laundry basket,shopping cart,cart,"
-        "shoe,shoes,table,desk,door,bucket,cooler,crate,traffic cone,"
-        "stroller,walker,vacuum cleaner,fan,heater,plant,pet bowl,cable,toy",
+        "bed,chair,computer monitor,laptop,television,laundry basket,"
+        "cardboard box,bag of chips",
     ).split(",")
     if name.strip()
 )
@@ -551,7 +548,7 @@ VOICE_PLAYBACK_COOLDOWN_SECONDS = float(
     os.environ.get("WHISPER_HAT_VOICE_COOLDOWN", "0") or 0.0
 )
 
-# Listener watchdog. This recovers only when the audio stream stops making
+# Listener watchdog. This requests recovery only when the audio stream stops making
 # progress or the worker thread dies, never just because the user is silent.
 # The normal listen timeout is 1 s and the phrase limit is 4 s; 12 s without a
 # heartbeat means a blocked stream read or a stuck native call.
@@ -561,6 +558,8 @@ VOICE_WATCHDOG_ENABLED = os.environ.get(
 VOICE_WATCHDOG_INTERVAL_SECONDS = 1.0
 VOICE_WATCHDOG_STALE_SECONDS = 12.0
 VOICE_RECOVERY_MIN_INTERVAL_SECONDS = 30.0
+VOICE_RECOVERY_GRACE_SECONDS = 3.0
+VOICE_SHUTDOWN_TIMEOUT_SECONDS = 3.0
 VOICE_STALE_PLAYBACK_SECONDS = 25.0
 
 # Low-volume status line, disabled by default. It also appears when
@@ -598,6 +597,13 @@ SCENE_DESCRIBE_ALIASES = (
 
 # Requires: sudo apt install -y tesseract-ocr
 ENABLE_OCR_READING = True
+VISION_COMMANDS_ENABLED = os.environ.get("WHISPER_HAT_VISION_COMMANDS", "1").strip().lower() in {"1", "true", "yes", "on"}
+CAPTION_TIMEOUT_SECONDS = float(os.environ.get("WHISPER_HAT_CAPTION_TIMEOUT", "40"))
+PPOCR_TIMEOUT_SECONDS = float(os.environ.get("WHISPER_HAT_PPOCR_TIMEOUT", "15"))
+OCR_FAILURE_MESSAGE = "I couldn't read that. Hold still and try again."
+caption_model = None
+ppocr_model = None
+caption_worker_thread = None
 OCR_BINARY = "tesseract"
 OCR_LANGUAGE = "eng"
 OCR_PSM = 3                      # 3 = fully automatic page segmentation
@@ -633,7 +639,7 @@ OCR_MAX_SPEECH_CHUNKS = 3
 # CAMERA_WIDTH x CAMERA_HEIGHT. The still is downscaled to OCR_MAX_WIDTH before
 # Tesseract so higher detail does not multiply OCR time without bound.
 OCR_USE_STILL = os.environ.get(
-    "WHISPER_HAT_OCR_STILL", "0"
+    "WHISPER_HAT_OCR_STILL", "1" if VISION_COMMANDS_ENABLED else "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 OCR_STILL_WIDTH = int(os.environ.get("WHISPER_HAT_OCR_STILL_WIDTH", "1920"))
 OCR_STILL_HEIGHT = int(os.environ.get("WHISPER_HAT_OCR_STILL_HEIGHT", "1440"))
@@ -941,6 +947,10 @@ voice_watchdog_thread = None
 voice_listener_source = None
 voice_listener_microphone = None
 voice_listener_source_lock = threading.Lock()
+voice_recovery_requested = threading.Event()
+voice_recovery_pending_reported = threading.Event()
+voice_listener_cleanup_failed = threading.Event()
+voice_recovery_request_time = 0.0
 voice_listener_heartbeat = 0.0
 voice_listener_stage = "stopped"
 voice_last_audio_monotonic = 0.0
@@ -1057,6 +1067,7 @@ def print_voice_summary():
         f"ocr_triggers={status['ocr_triggers']} "
         f"scene_triggers={status['scene_triggers']} "
         f"recoveries={status['recoveries']} "
+        f"recovery_pending={status['recovery_pending']} "
         f"last_audio_age_s={status['last_audio_age_s']} "
         f"last_processed_age_s={status['last_processed_age_s']} "
         f"speech_queue={status['speech_queue']} "
@@ -1100,6 +1111,7 @@ def _voice_status_snapshot():
         "speech_cleared": speech_cleared_count,
         "tts_active": speech_active_event.is_set(),
         "recoveries": voice_recovery_count,
+        "recovery_pending": voice_recovery_requested.is_set(),
     }
 
 
@@ -3284,6 +3296,45 @@ def _voice_microphone_name(index):
         return f"unavailable ({type(error).__name__})"
 
 
+class _VoiceRecoveryRequested(Exception):
+    """Leave calibration/listening at a safe point in the stream owner."""
+
+
+class _VoiceCleanupFailed(RuntimeError):
+    """Do not open another stream after incomplete teardown."""
+
+
+def _check_voice_recovery():
+    if voice_control_stop_event.is_set() or voice_recovery_requested.is_set():
+        raise _VoiceRecoveryRequested()
+
+
+class _OwnedVoiceStream:
+    """Keep native calls in the listener, including calibration chunk reads."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.owner = threading.get_ident()
+        self.closed = False
+
+    def read(self, size):
+        if threading.get_ident() != self.owner or self.closed:
+            raise RuntimeError("microphone read outside its live owner")
+        _check_voice_recovery()
+        # ponytail: blocking PyAudio read has no timeout/cancel API. A native
+        # hang stays pending; hard recovery deadlines require process isolation.
+        data = self.stream.read(size)
+        _check_voice_recovery()
+        return data
+
+    def close(self):
+        if threading.get_ident() != self.owner:
+            raise RuntimeError("microphone close outside its owner")
+        if not self.closed:
+            self.closed = True
+            self.stream.close()
+
+
 def _open_voice_source(mic_index):
     """Open the mic, trying fallback capture rates before giving up.
 
@@ -3300,6 +3351,7 @@ def _open_voice_source(mic_index):
 
     errors = []
     for rate in rates:
+        _check_voice_recovery()
         microphone = None
         try:
             with suppress_audio_stderr():
@@ -3308,6 +3360,8 @@ def _open_voice_source(mic_index):
                     sample_rate=rate,
                 )
                 source = microphone.__enter__()
+            if source.stream is None:
+                raise RuntimeError("microphone backend returned no open stream")
             name = _voice_microphone_name(mic_index)
             print(
                 f"[voice control] Microphone open: index={mic_index} "
@@ -3327,12 +3381,12 @@ def _open_voice_source(mic_index):
             return source, microphone, rate
         except Exception as error:
             errors.append(f"{rate}Hz: {type(error).__name__}: {error}")
-            if microphone is not None:
+            if microphone is not None and getattr(microphone, "stream", None) is not None:
                 try:
                     with suppress_audio_stderr():
                         microphone.__exit__(None, None, None)
-                except Exception:
-                    pass
+                except Exception as cleanup_error:
+                    raise _VoiceCleanupFailed(str(cleanup_error)) from cleanup_error
             _voice_debug("mic_open_failed", index=mic_index, rate=rate, error=error)
 
     raise RuntimeError("; ".join(errors) or "no capture rate available")
@@ -3433,6 +3487,28 @@ def _trigger_scene_description():
     voice_scene_triggers += 1
     scene_describe_event.set()
     return True
+
+
+def _respond_to_scene(frame, fallback, origin_perf):
+    """The camera/hazard loop only hands off pixels; it never waits for a caption."""
+    global caption_worker_thread
+    if caption_model is None:
+        return _play_direct_response(fallback, 2, origin_perf=origin_perf, origin_label="command")
+
+    def respond():
+        try:
+            text = caption_model.request(frame, CAPTION_TIMEOUT_SECONDS)["text"]
+            print(f"[caption] Florence-2-base: {text}", flush=True)
+        except Exception as error:
+            print(f"[caption] fallback: {type(error).__name__}: {error}", flush=True)
+            text = fallback
+        if not ocr_stop_event.is_set():
+            _play_direct_response(text, 2, origin_perf=origin_perf, origin_label="command")
+
+    if caption_worker_thread is not None and caption_worker_thread.is_alive():
+        return
+    caption_worker_thread = threading.Thread(target=respond, name="scene-caption-request", daemon=True)
+    caption_worker_thread.start()
 
 
 def _enabled_phrases(canonical, aliases, enabled=True):
@@ -3603,14 +3679,18 @@ def _voice_control_worker():
         tts_active=speech_active_event.is_set(),
     )
 
-    while not voice_control_stop_event.is_set():
+    recovery_waiting_for_audio = False
+    while not voice_control_stop_event.is_set() and not voice_listener_cleanup_failed.is_set():
         source = None
         microphone = None
         _set_voice_listener_source(None, None)
         _voice_heartbeat("opening")
         try:
+            _check_voice_recovery()
             source, microphone, _opened_rate = _open_voice_source(mic_index)
             _set_voice_listener_source(source, microphone)
+            source.stream = _OwnedVoiceStream(source.stream)
+            _check_voice_recovery()
             _voice_heartbeat("opened")
             print(
                 "[voice control] Calibrating USB microphone for ambient noise...",
@@ -3622,6 +3702,7 @@ def _voice_control_worker():
                 source,
                 duration=VOICE_AMBIENT_CALIBRATION_SECONDS,
             )
+            _check_voice_recovery()
             _voice_debug(
                 "ambient_calibrated",
                 seconds=round(time.monotonic() - calibrate_started, 3),
@@ -3639,6 +3720,7 @@ def _voice_control_worker():
             # Keep the ALSA/PipeWire capture stream open across listen cycles
             # instead of reopening PyAudio (and duplicating stderr FDs) every second.
             while not voice_control_stop_event.is_set():
+                _check_voice_recovery()
                 _voice_heartbeat("listening")
                 cooldown = _voice_playback_cooldown_remaining()
                 if cooldown > 0.0:
@@ -3723,6 +3805,13 @@ def _voice_control_worker():
                 text = _normalize_voice_command(result.get("text", ""))
                 voice_nonempty_results += int(bool(text))
                 voice_last_processed_monotonic = time.monotonic()
+                _check_voice_recovery()
+                if recovery_waiting_for_audio:
+                    recovery_waiting_for_audio = False
+                    print(
+                        "[voice control] recovery complete: replacement stream processed audio.",
+                        flush=True,
+                    )
                 _voice_heartbeat("listening")
                 _voice_debug(
                     "vosk_result",
@@ -3749,6 +3838,11 @@ def _voice_control_worker():
 
                 _apply_voice_command(text)
 
+        except _VoiceRecoveryRequested:
+            _voice_debug("recovery_acknowledged", shutdown=voice_control_stop_event.is_set())
+        except _VoiceCleanupFailed as error:
+            voice_listener_cleanup_failed.set()
+            print(f"[voice control] microphone teardown failed; no reopen: {error}", flush=True)
         except Exception as error:
             if voice_control_stop_event.is_set():
                 break
@@ -3762,58 +3856,47 @@ def _voice_control_worker():
             _voice_debug("worker_error", error=f"{type(error).__name__}: {error}")
             voice_control_stop_event.wait(1.0)
         finally:
-            _set_voice_listener_source(None, None)
             if microphone is not None:
+                _voice_heartbeat("closing")
                 try:
                     with suppress_audio_stderr():
                         microphone.__exit__(None, None, None)
-                except Exception:
-                    pass
-            _voice_heartbeat(
-                "stopped" if voice_control_stop_event.is_set() else "reopening"
-            )
-            _voice_debug("mic_closed", source_open=source is not None)
+                except Exception as error:
+                    voice_listener_cleanup_failed.set()
+                    print(f"[voice control] microphone teardown failed; no reopen: {error}", flush=True)
+            if voice_listener_cleanup_failed.is_set():
+                _voice_heartbeat("cleanup_failed")
+                # Keep published handles as evidence of incomplete teardown.
+                # Neither this worker nor the watchdog may open a replacement.
+            else:
+                _set_voice_listener_source(None, None)
+                with voice_listener_source_lock:
+                    if voice_recovery_requested.is_set():
+                        recovery_waiting_for_audio = not voice_control_stop_event.is_set()
+                        voice_recovery_requested.clear()
+                        voice_recovery_pending_reported.clear()
+                _voice_heartbeat(
+                    "stopped" if voice_control_stop_event.is_set() else "reopening"
+                )
+                _voice_debug("mic_closed", source_open=source is not None)
 
 
 
 def _force_unblock_voice_stream():
-    """Close the current capture stream so a blocked native read can return."""
+    """Request cooperative recovery; never touch another thread's stream.
+
+    Historical name retained for diagnostic callers. This cannot forcibly
+    unblock a native PyAudio read; only the owner may perform teardown.
+    """
+    global voice_recovery_request_time
     with voice_listener_source_lock:
-        source = voice_listener_source
-        microphone = voice_listener_microphone
-
-    if source is None and microphone is None:
-        _voice_debug("recovery_skipped", reason="no_listener_source")
-        return False
-
-    stream = getattr(source, "stream", None)
-    closed = False
-    if stream is not None:
-        for method_name in ("stop_stream", "close"):
-            method = getattr(stream, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                method()
-                closed = True
-            except Exception as error:
-                _voice_debug(
-                    "recovery_stream_error",
-                    method=method_name,
-                    error=f"{type(error).__name__}: {error}",
-                )
-
-    if microphone is not None:
-        try:
-            with suppress_audio_stderr():
-                microphone.__exit__(None, None, None)
-            closed = True
-        except Exception as error:
-            _voice_debug(
-                "recovery_mic_error",
-                error=f"{type(error).__name__}: {error}",
-            )
-    return closed
+        if voice_control_stop_event.is_set() or voice_recovery_requested.is_set():
+            return False
+        voice_recovery_request_time = time.monotonic()
+        voice_recovery_pending_reported.clear()
+        voice_recovery_requested.set()
+    _voice_debug("recovery_requested")
+    return True
 
 
 def _voice_watchdog_check(now=None):
@@ -3833,8 +3916,15 @@ def _voice_watchdog_check(now=None):
     thread = voice_control_thread
     if thread is None:
         return False
+    if voice_listener_cleanup_failed.is_set():
+        return False
 
     if not thread.is_alive():
+        with voice_listener_source_lock:
+            if voice_listener_source is not None or voice_listener_microphone is not None:
+                voice_listener_cleanup_failed.set()
+                print("[voice watchdog] owner exited without confirmed teardown; no reopen.", flush=True)
+                return False
         if now - voice_last_recovery_monotonic < VOICE_RECOVERY_MIN_INTERVAL_SECONDS:
             _voice_debug(
                 "recovery_rate_limited",
@@ -3858,9 +3948,23 @@ def _voice_watchdog_check(now=None):
         start_voice_control(start_watchdog=False)
         return True
 
+    if voice_recovery_requested.is_set():
+        if (
+            time.monotonic() - voice_recovery_request_time >= VOICE_RECOVERY_GRACE_SECONDS
+            and not voice_recovery_pending_reported.is_set()
+        ):
+            voice_recovery_pending_reported.set()
+            print(
+                "[voice watchdog] recovery still pending: owner has not reached a safe point. "
+                "Blocking native calls cannot be safely interrupted; no replacement will open "
+                "until owner teardown completes.",
+                flush=True,
+            )
+        return False
+
     active_stages = {
         "opening", "opened", "calibrating", "listening", "processing",
-        "recovering", "reopening",
+        "recovering", "reopening", "closing",
     }
     heartbeat_age = now - voice_listener_heartbeat
     if voice_listener_stage in active_stages and heartbeat_age > VOICE_WATCHDOG_STALE_SECONDS:
@@ -3868,7 +3972,7 @@ def _voice_watchdog_check(now=None):
             _voice_debug(
                 "recovery_rate_limited",
                 reason="stale_stream",
-                stage=voice_listener_stage,
+                listener_stage=voice_listener_stage,
                 age_s=round(heartbeat_age, 1),
                 remaining_s=round(
                     VOICE_RECOVERY_MIN_INTERVAL_SECONDS
@@ -3887,12 +3991,11 @@ def _voice_watchdog_check(now=None):
             f"{heartbeat_age:.1f}s at stage={voice_listener_stage} "
             f"tts_active={speech_active_event.is_set()} "
             f"last_audio_age_s={last_audio_age}; "
-            "closing the capture stream to unblock the read.",
+            "requesting recovery from the capture owner.",
             flush=True,
         )
         voice_last_recovery_monotonic = now
         voice_recovery_count += 1
-        _voice_heartbeat("recovering")
         _force_unblock_voice_stream()
         return True
 
@@ -3948,6 +4051,15 @@ def start_voice_control(start_watchdog=True):
         return
 
     with voice_control_lifecycle_lock:
+        if voice_control_stop_event.is_set() and not start_watchdog:
+            return
+        if (
+            voice_listener_cleanup_failed.is_set()
+            or voice_listener_source is not None
+            or voice_listener_microphone is not None
+        ):
+            print("[voice control] Previous microphone teardown is incomplete; no restart.", flush=True)
+            return
         if voice_control_thread is not None and voice_control_thread.is_alive():
             print("[voice control] Worker is already running.", flush=True)
             return
@@ -3961,6 +4073,8 @@ def start_voice_control(start_watchdog=True):
         )
 
         voice_control_stop_event.clear()
+        voice_recovery_requested.clear()
+        voice_recovery_pending_reported.clear()
         voice_control_thread = threading.Thread(
             target=_voice_control_worker_safe,
             name="whisper-hat-voice-control",
@@ -3981,12 +4095,23 @@ def start_voice_control(start_watchdog=True):
 
 def stop_voice_control():
     global voice_listener_stage
-    voice_control_stop_event.set()
-    if voice_control_thread is not None and voice_control_thread.is_alive():
-        voice_control_thread.join(timeout=3.0)
-    if voice_watchdog_thread is not None and voice_watchdog_thread.is_alive():
-        voice_watchdog_thread.join(timeout=2.0)
-    voice_listener_stage = "stopped"
+    with voice_control_lifecycle_lock:
+        voice_control_stop_event.set()
+        threads = (voice_control_thread, voice_watchdog_thread)
+    deadline = time.monotonic() + VOICE_SHUTDOWN_TIMEOUT_SECONDS
+    for thread in threads:
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if any(thread is not None and thread.is_alive() for thread in threads):
+        voice_listener_stage = "shutdown_pending"
+        print(
+            "[voice control] shutdown pending: owner has not completed; "
+            "no cross-thread teardown or reopen. If a native call never returns, process exit is required.",
+            flush=True,
+        )
+        return False
+    voice_listener_stage = "cleanup_failed" if voice_listener_cleanup_failed.is_set() else "stopped"
+    return not voice_listener_cleanup_failed.is_set()
 
 
 # ============================================================
@@ -4001,7 +4126,7 @@ def _ocr_available():
         if not _ocr_available_cache and not _ocr_missing_warned:
             _ocr_missing_warned = True
             print(
-                f"[ocr] '{OCR_BINARY}' not found; text reading is unavailable. "
+                f"[ocr] '{OCR_BINARY}' not found; Tesseract fallback is unavailable. "
                 "Install it with: sudo apt install -y tesseract-ocr",
                 flush=True,
             )
@@ -4029,20 +4154,20 @@ def _clean_ocr_text(text):
     return " ".join(kept)
 
 
-def _split_ocr_speech_chunks(text):
+def _split_ocr_speech_chunks(text, verbatim=False):
     """Split readable OCR text into short, speakable chunks.
 
     The first chunk is deliberately short so the user hears useful content
     before a long OCR block can occupy the speech worker. Cuts prefer sentence
     punctuation, then whitespace; never split inside a word.
     """
-    remaining = _clean_ocr_text(text)
+    remaining = " ".join(text.split()) if verbatim else _clean_ocr_text(text)
     if not remaining:
         return []
 
     chunks = []
     limit = max(40, int(OCR_SPEECH_CHUNK_CHARS))
-    for _ in range(max(1, int(OCR_MAX_SPEECH_CHUNKS))):
+    for _ in range(len(remaining) + 1 if verbatim else max(1, int(OCR_MAX_SPEECH_CHUNKS))):
         if not remaining:
             break
         if len(remaining) <= limit:
@@ -4412,9 +4537,9 @@ def _perform_ocr_read(source):
         source=type(source).__name__ if source is not None else None,
     )
 
-    if not _ocr_available():
+    if ppocr_model is None and not _ocr_available():
         _play_direct_response(
-            "Text reading isn't available.",
+            OCR_FAILURE_MESSAGE,
             origin_perf=ocr_last_trigger_monotonic,
         )
         return
@@ -4423,7 +4548,10 @@ def _perform_ocr_read(source):
     dump_path = _begin_ocr_dump(frame, ocr_frame_origin)
     original_shape = None if frame is None else frame.shape
     original_metrics = _ocr_frame_metrics(frame)
-    frame = _prepare_ocr_frame(frame, unmirror=getattr(source, "ocr_mirrored", False))
+    if frame is not None and getattr(source, "ocr_mirrored", False):
+        frame = cv2.flip(frame, 1)
+    neural_frame = frame
+    frame = _prepare_ocr_frame(frame)
     _voice_debug(
         "ocr_frame",
         elapsed_s=round(time.monotonic() - started, 3),
@@ -4438,26 +4566,50 @@ def _perform_ocr_read(source):
     )
     if frame is None:
         _play_direct_response(
-            "I can't see right now.",
+            OCR_FAILURE_MESSAGE,
             origin_perf=ocr_last_trigger_monotonic,
         )
         return
 
+    neural_result = None
+    if ppocr_model is not None:
+        try:
+            neural_result = ppocr_model.request(neural_frame, PPOCR_TIMEOUT_SECONDS)
+            if not neural_result.get("reliable"):
+                raise ValueError("PP-OCRv5 regions did not pass the confidence gate")
+            if dump_path is not None:
+                neural_dump = dump_path.with_name(dump_path.name.replace("tesseract-input", "ppocr-input"))
+                try:
+                    if not cv2.imwrite(str(neural_dump), neural_frame):
+                        raise OSError(f"could not write {neural_dump}")
+                    print(f"[ocr dump] PP-OCRv5 input={neural_frame.shape[1]}x{neural_frame.shape[0]} path={neural_dump.resolve()}", flush=True)
+                except Exception as error:
+                    print(f"[ocr dump] failed: {error}", flush=True)
+            print(f"[ocr] PP-OCRv5: {neural_result['text']!r}", flush=True)
+        except Exception as error:
+            neural_result = None
+            print(f"[ocr] PP-OCRv5 fallback to Tesseract: {type(error).__name__}: {error}", flush=True)
     try:
-        if dump_path is None:
+        if neural_result is not None:
+            raw_text = neural_result["text"]
+            words = [(word, 100 * region["confidence"]) for region in neural_result["regions"] for word in region["text"].split()]
+            metrics = _ocr_text_metrics(raw_text, words)
+        elif not _ocr_available():
+            raise RuntimeError("Neither OCR engine is available")
+        elif dump_path is None:
             raw_text, words, metrics = _run_tesseract_tsv(frame)
         else:
             raw_text, words, metrics = _run_tesseract_tsv(frame, dump_path=dump_path)
     except Exception as error:
         _voice_debug("ocr_failed", error=f"{type(error).__name__}: {error}")
         _play_direct_response(
-            "I couldn't read that.",
+            OCR_FAILURE_MESSAGE,
             origin_perf=ocr_last_trigger_monotonic,
         )
         return
 
-    text = _clean_ocr_text(raw_text)
-    quality_ok = _ocr_quality_ok(metrics)
+    text = " ".join(raw_text.split())
+    quality_ok = neural_result is not None or _ocr_quality_ok(metrics)
     _voice_debug(
         "ocr_tesseract_done",
         raw_chars=len(raw_text),
@@ -4481,7 +4633,7 @@ def _perform_ocr_read(source):
     )
     if not text:
         _play_direct_response(
-            "I don't see any text.",
+            OCR_FAILURE_MESSAGE,
             origin_perf=ocr_last_trigger_monotonic,
         )
         return
@@ -4493,14 +4645,19 @@ def _perform_ocr_read(source):
             elapsed_s=round(time.monotonic() - started, 3),
         )
         _play_direct_response(
-            "I couldn't read the page. Hold it steady and try again.",
+            OCR_FAILURE_MESSAGE,
             origin_perf=ocr_last_trigger_monotonic,
         )
         return
 
-    chunks = _split_ocr_speech_chunks(text)
+    chunks = _split_ocr_speech_chunks(text, verbatim=True)
     queued_count = 0
     for index, chunk in enumerate(chunks):
+        # Feed long readings gradually from this worker, reserving queue space
+        # for warnings. Never make the camera, microphone or speech worker wait.
+        while speech_queue.qsize() >= 2:
+            if ocr_stop_event.wait(.05):
+                return
         queued = _play_direct_response(
             chunk,
             origin_perf=ocr_last_trigger_monotonic if index == 0 else None,
@@ -4578,7 +4735,7 @@ def _ocr_reader_worker():
 
 
 def start_ocr_reader(source):
-    global ocr_worker_thread, ocr_camera_source
+    global ocr_worker_thread, ocr_camera_source, caption_model, ppocr_model
     if not ENABLE_OCR_READING:
         return
     if ocr_worker_thread is not None and ocr_worker_thread.is_alive():
@@ -4586,6 +4743,17 @@ def start_ocr_reader(source):
     ocr_camera_source = source
     ocr_stop_event.clear()
     ocr_trigger_event.clear()
+    if VISION_COMMANDS_ENABLED:
+        from voice_vision import RequestModel
+        for kind in ("caption", "ocr"):
+            try:
+                model = RequestModel(kind)
+                if kind == "caption":
+                    caption_model = model
+                else:
+                    ppocr_model = model
+            except Exception as error:
+                print(f"[voice vision] {kind} unavailable; using existing response: {error}", flush=True)
     ocr_worker_thread = threading.Thread(
         target=_ocr_reader_worker,
         name="whisper-hat-ocr-reader",
@@ -4595,9 +4763,15 @@ def start_ocr_reader(source):
 
 
 def stop_ocr_reader():
-    global current_ocr_process
+    global current_ocr_process, caption_model, ppocr_model
     ocr_stop_event.set()
     ocr_trigger_event.set()
+    for model in (caption_model, ppocr_model):
+        if model is not None:
+            model.close()
+    caption_model = ppocr_model = None
+    if caption_worker_thread is not None:
+        caption_worker_thread.join(timeout=1)
     with current_ocr_process_lock:
         process = current_ocr_process
         current_ocr_process = None
@@ -5569,6 +5743,8 @@ class LatestFrameSource:
         capture = getattr(self.source, "capture_still", None)
         if not callable(capture):
             return None
+        if getattr(self.source, "concurrent_still", False):
+            return capture()
 
         with self.condition:
             self.still_capture_started_monotonic = (
@@ -5614,8 +5790,15 @@ class Picamera2Source:
 
         # RGB888 is used directly by this OpenCV pipeline.
         # buffer_count=4 helps avoid frame starvation when YOLO is busy.
+        self.concurrent_still = VISION_COMMANDS_ENABLED and USE_LATEST_FRAME_THREAD
+        streams = dict(main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"})
+        if self.concurrent_still:
+            streams = dict(
+                main={"size": (OCR_STILL_WIDTH, OCR_STILL_HEIGHT), "format": "RGB888"},
+                lores={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "YUV420"},
+            )
         config = self.picam2.create_preview_configuration(
-            main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"},
+            **streams,
             transform=transform,
             buffer_count=4,
             controls={"FrameRate": CAMERA_FPS},
@@ -5628,6 +5811,10 @@ class Picamera2Source:
         self.ocr_mirrored = bool(CAMERA_HFLIP) != bool(CAMERA_VFLIP)
         self.still_config = None
         self.io_lock = threading.Lock()
+        self.still_condition = threading.Condition()
+        self.still_requested = False
+        self.still_frame = None
+        self.closed = False
 
         sensor_model = self.picam2.camera_properties.get("Model", "unknown")
         print(f"Picamera2 opened camera index {PICAMERA2_CAMERA_INDEX}: {sensor_model}")
@@ -5662,6 +5849,18 @@ class Picamera2Source:
 
     def read(self):
         try:
+            if self.concurrent_still:
+                request = self.picam2.capture_request()
+                try:
+                    frame_bgr = cv2.cvtColor(request.make_array("lores"), cv2.COLOR_YUV2BGR_I420)
+                    with self.still_condition:
+                        if self.still_requested:
+                            self.still_frame = request.make_array("main").copy()
+                            self.still_requested = False
+                            self.still_condition.notify_all()
+                    return True, frame_bgr
+                finally:
+                    request.release()
             with self.io_lock:
                 frame_bgr = self.picam2.capture_array("main")
             return True, frame_bgr
@@ -5671,6 +5870,17 @@ class Picamera2Source:
 
     def capture_still(self):
         """Capture one OCR still without changing the preview stream size."""
+        if self.concurrent_still:
+            with self.still_condition:
+                self.still_frame = None
+                self.still_requested = True
+                self.still_condition.notify_all()
+                self.still_condition.wait_for(
+                    lambda: not self.still_requested or self.closed,
+                    timeout=OCR_STILL_CAPTURE_WAIT_SECONDS,
+                )
+                self.still_requested = False
+                return self.still_frame
         switch_capture = getattr(
             self.picam2, "switch_mode_and_capture_array", None
         )
@@ -5706,6 +5916,10 @@ class Picamera2Source:
                 return None
 
     def release(self):
+        with self.still_condition:
+            self.closed = True
+            self.still_requested = False
+            self.still_condition.notify_all()
         try:
             self.picam2.stop()
         except Exception:
@@ -5899,7 +6113,7 @@ def name_tof_obstacle(model, frame, distance_m, snapshot, overlap, diagnostics=N
 
 
 def _load_open_vocab_model():
-    """Load the opt-in broad-vocabulary detector.
+    """Load the configured broad-vocabulary detector.
 
     YOLOE with a fixed prompt list keeps inference offline after the text
     embeddings are built/exported. A prompt-free or exported model loads with
@@ -5986,7 +6200,7 @@ def main():
     emotion_recognizer = EmotionRecognizer(EMOTION_MODEL_FILE)
 
     if OPEN_VOCAB_ENABLED:
-        print("Loading opt-in open-vocabulary model...")
+        print("Loading open-vocabulary model...")
         print(f"Model: {OPEN_VOCAB_MODEL}")
         print(f"Open-vocabulary prompts: {', '.join(OPEN_VOCAB_CLASSES)}")
     else:
@@ -6155,7 +6369,7 @@ def main():
                 maybe_print_tof_summary(tof_snapshot)
 
             # Display overlays below mutate frame; naming must see camera pixels.
-            naming_frame = frame.copy() if detection_enabled and SHOW_WINDOW else frame
+            naming_frame = frame.copy() if SHOW_WINDOW and (detection_enabled or describe_requested) else frame
             if naming_capture is not None and detection_ran:
                 last_detection_frame = naming_frame.copy() if naming_frame is frame else naming_frame
                 last_detection_frame_number = frame_count
@@ -6578,12 +6792,7 @@ def main():
                         if detection_enabled and detection_is_enabled()
                         else "Detection is off."
                     )
-                    _play_direct_response(
-                        description,
-                        2,
-                        origin_perf=scene_last_trigger_monotonic,
-                        origin_label="command",
-                    )
+                    _respond_to_scene(naming_frame.copy(), description, scene_last_trigger_monotonic)
 
             # Announce at most one expression per loop. Skip this frame when a
             # safety warning was just queued, then try again on a later stable

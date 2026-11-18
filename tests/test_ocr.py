@@ -242,7 +242,7 @@ def test_perform_ocr_read_no_text(new, monkeypatch):
         lambda f: ("", [], new._ocr_text_metrics("", [])),
     )
     new._perform_ocr_read(object())
-    assert spoken == [(2, "I don't see any text.")]
+    assert spoken == [(2, new.OCR_FAILURE_MESSAGE)]
 
 
 def test_perform_ocr_read_rejects_gibberish(new, monkeypatch):
@@ -257,7 +257,7 @@ def test_perform_ocr_read_rejects_gibberish(new, monkeypatch):
     new._perform_ocr_read(object())
     assert spoken == [(
         2,
-        "I couldn't read the page. Hold it steady and try again.",
+        new.OCR_FAILURE_MESSAGE,
     )]
 
     # The rejected raw text must never be queued.
@@ -309,7 +309,7 @@ def test_perform_ocr_read_unavailable(new, monkeypatch):
     spoken = _capture_speech(new, monkeypatch)
     monkeypatch.setattr(new, "_ocr_available", lambda: False)
     new._perform_ocr_read(object())
-    assert spoken == [(2, "Text reading isn't available.")]
+    assert spoken == [(2, new.OCR_FAILURE_MESSAGE)]
 
 
 def test_perform_ocr_read_failure(new, monkeypatch):
@@ -322,7 +322,7 @@ def test_perform_ocr_read_failure(new, monkeypatch):
 
     monkeypatch.setattr(new, "_run_tesseract_tsv", boom)
     new._perform_ocr_read(object())
-    assert spoken == [(2, "I couldn't read that.")]
+    assert spoken == [(2, new.OCR_FAILURE_MESSAGE)]
 
 
 def test_perform_ocr_read_no_frame(new, monkeypatch):
@@ -330,7 +330,7 @@ def test_perform_ocr_read_no_frame(new, monkeypatch):
     monkeypatch.setattr(new, "_ocr_available", lambda: True)
     monkeypatch.setattr(new, "_grab_ocr_frame", lambda s: None)
     new._perform_ocr_read(object())
-    assert spoken == [(2, "I can't see right now.")]
+    assert spoken == [(2, new.OCR_FAILURE_MESSAGE)]
 
 
 # --- tesseract subprocess -------------------------------------------------
@@ -468,6 +468,7 @@ def test_trigger_ocr_cooldown(new, monkeypatch):
 
 # --- worker lifecycle / shutdown -----------------------------------------
 def test_ocr_worker_lifecycle(new, monkeypatch):
+    monkeypatch.setattr(new, "VISION_COMMANDS_ENABLED", False)
     monkeypatch.setattr(new, "ENABLE_OCR_READING", True)
     monkeypatch.setattr(new, "_ocr_available", lambda: True)
     monkeypatch.setattr(new, "_perform_ocr_read", lambda source: None)
@@ -613,11 +614,7 @@ def test_ocr_dump_pair_survives_rejection(
     assert np.array_equal(new.cv2.imread(str(original_path)), original)
     assert input_path.read_bytes() == inputs[0]  # Exact bytes sent to Tesseract.
     assert new.cv2.imread(str(input_path)).shape == (12, 16, 3)
-    expected = (
-        "I don't see any text." if result == "empty"
-        else "I couldn't read the page. Hold it steady and try again."
-    )
-    assert spoken == [(2, expected)]
+    assert spoken == [(2, new.OCR_FAILURE_MESSAGE)]
     log = capsys.readouterr().out
     for value in ("source=still", "original=32x24", "input=16x12",
                   str(original_path.resolve()), str(input_path.resolve())):
@@ -661,7 +658,7 @@ def test_ocr_dump_write_failure_keeps_ocr_running(
     new._perform_ocr_read(source)
     new._perform_ocr_read(source)
     assert len(inputs) == 2
-    assert spoken == [(2, "I don't see any text.")] * 2
+    assert spoken == [(2, new.OCR_FAILURE_MESSAGE)] * 2
     assert new._ocr_dump_attempted is True
     log = capsys.readouterr().out
     assert log.count("failed:") == 1  # Failed writes also consume the one shot.
@@ -708,6 +705,7 @@ def test_ocr_unmirrors_once_without_changing_capture(
 def test_picamera_mirror_metadata_preserves_preview_and_still_transform(
     new, monkeypatch, hflip, vflip
 ):
+    monkeypatch.setattr(new, "VISION_COMMANDS_ENABLED", False)
     captured = {}
     frame = _frame()
     camera = SimpleNamespace(

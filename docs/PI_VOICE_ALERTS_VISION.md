@@ -196,13 +196,25 @@ What changed (opt-in diagnostics, baseline behavior otherwise):
 
 - The listener now records a heartbeat at every real stage: `opening`,
   `opened`, `calibrating`, `listening`, `processing`, `error`, `reopening`.
-- A watchdog runs every `VOICE_WATCHDOG_INTERVAL_SECONDS` (1 s). It recovers
+- A watchdog runs every `VOICE_WATCHDOG_INTERVAL_SECONDS` (1 s). It requests recovery
   **only** when the worker thread is dead or a stage heartbeat is older than
   `VOICE_WATCHDOG_STALE_SECONDS` (12 s). Normal silence is not a failure: the
   1 s `listen()` timeout refreshes the heartbeat.
-- Recovery closes/stops the current PyAudio stream so a blocked native read can
-  return, then lets the worker reopen the microphone. Retries are rate-limited
-  by `VOICE_RECOVERY_MIN_INTERVAL_SECONDS` (30 s) and the skip reason is logged.
+- Recovery is cooperative: only the listener opens, reads, stops and closes its
+  microphone. The watchdog sets a request; cancellation checks before/after each
+  calibration/listening chunk leave recognition in the owner. Teardown completes
+  before reopening; failed teardown prevents restart. Requests are rate-limited
+  by `VOICE_RECOVERY_MIN_INTERVAL_SECONDS` (30 s). The log confirms recovery only
+  when `replacement stream processed audio` appears, not just `Microphone open`.
+- SpeechRecognition uses blocking PyAudio reads with no timeout/cancel argument.
+  An indefinitely stuck native open/read/close cannot safely be interrupted here.
+  After `VOICE_RECOVERY_GRACE_SECONDS` (3 s) the watchdog reports recovery pending;
+  it never closes the stream from another thread. Shutdown joins for at most
+  `VOICE_SHUTDOWN_TIMEOUT_SECONDS` (3 s total), returns false and reports
+  `shutdown_pending` if the owner remains blocked. No replacement is opened.
+  Fully bounded forced recovery would require a separate capture process; this
+  patch does not claim that capability. The historical `recoveries` counter
+  counts watchdog recovery attempts, not proven replacement audio processing.
 - Stale playback suppression is cleared only when `speech_active_event` has
   been set for more than `VOICE_STALE_PLAYBACK_SECONDS` (25 s) **and** the
   playback process is gone or finished. A genuinely playing warning is not
@@ -399,20 +411,16 @@ mixed with scene description.
 
 ### 2.4 Implemented open-vocabulary prototype
 
-The default remains YOLO11n/COCO. A YOLOE candidate is wired behind an explicit
-flag:
+Prompted YOLOE is the default main detector, using the existing loader and
+`yoloe-11s-seg.pt`. Set `WHISPER_HAT_OPEN_VOCAB=0` to restore YOLO11n/COCO.
 
 ```bash
 # Fixed prompt list, first run may download/build CLIP text embeddings
 WHISPER_HAT_OPEN_VOCAB=1 WHISPER_HAT_OPEN_VOCAB_MODEL=yoloe-11s-seg.pt python whisper.py
 ```
 
-The default prompt list is intentionally small and obstacle-oriented:
-`chair`, `stool`, `bench`, `cardboard box`, `box`, `package`, `bag`,
-`backpack`, `handbag`, `suitcase`, `trash can`, `bin`, `basket`,
-`laundry basket`, `shopping cart`, `cart`, `shoe`, `shoes`, `table`, `desk`,
-`door`, `bucket`, `cooler`, `crate`, `traffic cone`, `stroller`, `walker`,
-`vacuum cleaner`, `fan`, `heater`, `plant`, `pet bowl`, `cable`, `toy`.
+The default prompt list is `bed`, `chair`, `computer monitor`, `laptop`,
+`television`, `laundry basket`, `cardboard box`, and `bag of chips`.
 
 Override with a comma-separated list:
 
@@ -420,7 +428,7 @@ Override with a comma-separated list:
 WHISPER_HAT_OPEN_VOCAB=1 WHISPER_HAT_OPEN_VOCAB_CLASSES='chair,stool,box,cardboard box,laundry basket,trash can,bin,basket,cart,shoe' python whisper.py
 ```
 
-The opt-in model runs continuously at `WHISPER_HAT_OPEN_VOCAB_IMG_SIZE`
+The default model runs continuously at `WHISPER_HAT_OPEN_VOCAB_IMG_SIZE`
 (defaults to `IMG_SIZE`) and uses the same `PROCESS_EVERY_N_FRAMES` schedule.
 `load_detection_model()` removes the COCO ID filter for this model, because
 YOLOE class IDs are not COCO IDs. `STATIC_OBSTACLE_CLASSES` includes the prompt
@@ -465,18 +473,18 @@ git switch -c baseline-fd76cda fd76cda
 git switch main
 ```
 
-The default runtime after these changes is still the baseline model profile.
-Heavier models are opt-in:
+Prompted YOLOE is now the default. The following YOLO11 profiles apply only
+with `WHISPER_HAT_OPEN_VOCAB=0`:
 
 ```bash
-# Baseline (default)
-python whisper.py
+# YOLO11n rollback
+WHISPER_HAT_OPEN_VOCAB=0 python whisper.py
 
 # YOLO11s at 384, opt-in only
-WHISPER_HAT_MODEL_PROFILE=accuracy python whisper.py
+WHISPER_HAT_OPEN_VOCAB=0 WHISPER_HAT_MODEL_PROFILE=accuracy python whisper.py
 
 # YOLO11m at 416, opt-in only (expected to be too slow for real-time)
-WHISPER_HAT_MODEL_PROFILE=max_accuracy python whisper.py
+WHISPER_HAT_OPEN_VOCAB=0 WHISPER_HAT_MODEL_PROFILE=max_accuracy python whisper.py
 ```
 
 ### 3.2 Voice test matrix

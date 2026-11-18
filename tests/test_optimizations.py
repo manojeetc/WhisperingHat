@@ -31,6 +31,7 @@ def _rms(x):
 
 # --- YOLO Conv+BN fusion --------------------------------------------------
 def test_load_detection_model_fuses_pytorch(new, monkeypatch):
+    monkeypatch.setattr(new, "OPEN_VOCAB_ENABLED", False)
     record = {}
 
     class FakeYOLO:
@@ -49,6 +50,7 @@ def test_load_detection_model_fuses_pytorch(new, monkeypatch):
 
 
 def test_load_detection_model_skips_fuse_for_non_pytorch(new, monkeypatch):
+    monkeypatch.setattr(new, "OPEN_VOCAB_ENABLED", False)
     class FakeYOLO:
         def __init__(self, name):
             pass
@@ -114,7 +116,45 @@ def test_fast_path_still_unchanged(new):
     raw = np.arange(-100, 100, dtype=np.int16).tobytes()
     assert new._convert_audio_to_16khz_mono_int16(_Audio(raw, 2, 16000)) == raw
 
-# --- Opt-in broad-vocabulary detector ------------------------------------
+# --- Broad-vocabulary detector and baseline rollback ---------------------
+
+@pytest.mark.parametrize("override,enabled", [(None, True), ("0", False)])
+def test_prompted_yoloe_default_and_explicit_opt_out(new, monkeypatch, override, enabled):
+    import runpy
+
+    for name in ("WHISPER_HAT_OPEN_VOCAB", "WHISPER_HAT_OPEN_VOCAB_MODEL",
+                 "WHISPER_HAT_OPEN_VOCAB_PROMPT_FREE", "WHISPER_HAT_OPEN_VOCAB_CLASSES"):
+        monkeypatch.delenv(name, raising=False)
+    if override is not None:
+        monkeypatch.setenv("WHISPER_HAT_OPEN_VOCAB", override)
+    config = runpy.run_path(new.__file__)
+    assert config["OPEN_VOCAB_ENABLED"] is enabled
+    assert config["OPEN_VOCAB_MODEL"] == "yoloe-11s-seg.pt"
+    assert config["OPEN_VOCAB_PROMPT_FREE"] is False
+    assert config["OPEN_VOCAB_CLASSES"] == (
+        "bed", "chair", "computer monitor", "laptop", "television",
+        "laundry basket", "cardboard box", "bag of chips",
+    )
+
+
+def test_open_vocab_opt_out_loads_existing_detection_profile(new, monkeypatch):
+    calls = []
+
+    class FakeYOLO:
+        def __init__(self, name):
+            calls.append(name)
+
+        def fuse(self, verbose=False):
+            pass
+
+    monkeypatch.setattr(new, "OPEN_VOCAB_ENABLED", False)
+    monkeypatch.setattr(new, "YOLO", FakeYOLO)
+    monkeypatch.setattr(new, "YOLOE", lambda *args: pytest.fail("opt-out must not load YOLOE"))
+    assert isinstance(new.load_detection_model(), FakeYOLO)
+    assert calls == [new.MODEL_NAME]
+    assert new.DETECTION_CLASSES == new.YOLO_CLASSES_TO_KEEP
+    assert new.DETECTION_IMG_SIZE == new.IMG_SIZE
+
 def test_open_vocab_yoloe_sets_fixed_classes(new, monkeypatch):
     record = {}
 
