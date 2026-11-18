@@ -66,6 +66,14 @@ def reset_state(mod, grid=None, now=1000.0):
     mod.emotion_speech_memory.clear()
     mod.last_global_alert_time = 0.0
     mod.last_cleanup_time = 0.0
+    mod.last_alert_decision = {}
+    mod.scene_last_trigger_monotonic = 0.0
+    mod.ocr_last_trigger_monotonic = 0.0
+    mod.reset_unknown_obstacle_state()
+    mod.last_unknown_debug_time = 0.0
+    mod._set_speech_active(False)
+    if hasattr(mod, "clear_waiting_speech"):
+        mod.clear_waiting_speech()
     with mod.tof_state_lock:
         mod.tof_state["grid_mm"] = grid
         mod.tof_state["status_grid"] = None
