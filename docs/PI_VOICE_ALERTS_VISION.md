@@ -729,6 +729,77 @@ fixed, or the vocabulary upgrade successful, until these Pi logs exist.
 
 ### 3.7 OCR quality and interruption test
 
+#### Next Pi test: inspect the actual images first
+
+The Pi run at `863a6ea` did not read the book successfully. Both high-resolution
+attempts captured 1920x1440 and sent 1024x768 to Tesseract: one returned no words,
+the other 24 words at mean confidence 44. Both were correctly rejected. The
+observed detection-frame gaps were about 0.26-0.29 s. Without the images, focus,
+framing, orientation, resizing, and preprocessing remain undiagnosed.
+
+Stop the WhisperingHat boot service **before** a manual run so it releases the
+camera and microphone. The service unit name is not recorded in this repository;
+find it with `systemctl list-unit-files --type=service | grep -i whisper`, then
+run `sudo systemctl stop ACTUAL_UNIT.service` (use the actual unit name). If the
+boot launcher has another name, stop that launcher instead. Stay **stationary**
+throughout this high-resolution test because still capture pauses fresh obstacle
+updates.
+
+```bash
+cd ~/WhisperingHat
+WHISPER_HAT_OCR_STILL=1 WHISPER_HAT_OCR_DUMP_ONCE=1 \
+  WHISPER_HAT_OCR_QUALITY=1 WHISPER_HAT_OCR_MAX_WIDTH=1024 \
+  WHISPER_HAT_OCR_STILL_WIDTH=1920 WHISPER_HAT_OCR_STILL_HEIGHT=1440 \
+  WHISPER_HAT_VOICE_DEBUG=1 WHISPER_HAT_LATENCY_DEBUG=1 \
+  .venv/bin/python -u whisper.py 2>&1 | tee /tmp/whisper-ocr-dump.log
+```
+
+Say **"read this"** with the real printed page in view. The first request with
+an image writes one matched PNG pair, including when OCR returns no words or
+the quality gate rejects it. Subsequent requests in that app run write nothing;
+restart to collect another pair. The option is off by default and does not
+enable high-resolution capture by itself.
+
+`[ocr dump]` logs the capture source, dimensions, and absolute paths even without
+voice debugging. The private output directory is
+`/tmp/whisper-hat-ocr-<id>/` on a standard Pi setup (the system temporary directory
+is used; trust the logged paths if `TMPDIR` differs). Both filenames share that
+attempt ID:
+
+- `whisper-hat-ocr-<id>-still-original.png`: capture output saved before OCR
+  resizing or other OCR transforms.
+- `whisper-hat-ocr-<id>-still-tesseract-input.png`: the exact encoded PNG bytes
+  piped to Tesseract, with no independent reconstruction.
+
+If still capture falls back, the pair uses `preview-peek` or `preview-read`
+instead of `still`. Files stay local, outside Git; the dump refuses a temporary
+directory inside a Git working tree. Write failures are logged and OCR continues
+without retrying the dump. A failed write can leave a partial pair.
+
+After Ctrl+C, retrieve the two images from Windows PowerShell. Replace
+`PI_USER`, `PI_HOST`, and the directory below with the exact logged directory:
+
+```powershell
+scp "PI_USER@PI_HOST:/tmp/whisper-hat-ocr-<id>/*.png" "$env:USERPROFILE\Downloads\"
+```
+
+Inspect both images against the actual printed page. If the original is sharp
+and upright but the Tesseract input loses legibility, compare the current
+pipeline against **crop the page before resizing**, using the **same saved
+original** and the same OCR settings. Judge actual recognized text against the
+page, not confidence alone. If the original is blurry, sideways, or clipped,
+report that evidence first; cropping or loosening the gate is not an established
+fix. Keep the quality gate enabled. No diagnosis or crop change is justified
+until these images are available.
+
+Track the microphone stall independently: the watchdog fired while TTS was
+inactive, so playback overlap alone cannot explain it. Preserve the preceding
+`listen_wait`, watchdog, and next `listen_return` (or its absence), including TTS
+state, for a separate investigation. This image-dump patch does not change the
+recognizer or microphone recovery.
+
+#### Broader OCR and interruption matrix (after image inspection)
+
 Use a real book page, not a synthetic screenshot. Run with the detection stream
 unchanged and test both preview-frame OCR and the high-resolution still:
 
@@ -749,9 +820,8 @@ first, then compare what the hat actually reads against it; `quality_ok=True`
 alone is not a pass. Then repeat at about 0.5 m, 0.8 m, and 1.2 m. Try rotated
 pages separately (90 and 180 degrees) after the upright comparison, so
 orientation does not confound the resolution result. Do not change
-preprocessing thresholds until focus/framing is ruled out. To see the raw
-behavior without the gate for one diagnostic run, set
-`WHISPER_HAT_OCR_QUALITY=0`; never use that setting for normal use.
+preprocessing thresholds until focus/framing is ruled out. Keep the quality
+gate enabled while collecting and comparing the images.
 
 Read these fields from each `read this` attempt:
 

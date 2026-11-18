@@ -535,3 +535,135 @@ def test_run_tesseract_tsv_requests_tsv_config(new, monkeypatch):
     assert text == "Hello"
     assert words == [("Hello", 90.0)]
     assert metrics["word_count"] == 1
+
+
+# --- one-shot local image diagnostics ------------------------------------
+@pytest.fixture
+def dump_reader(new, monkeypatch, tmp_path):
+    monkeypatch.setattr(new, "OCR_DUMP_ONCE", True)
+    monkeypatch.setattr(new, "_ocr_dump_attempted", False)
+    monkeypatch.setattr(new, "OCR_USE_STILL", True)
+    monkeypatch.setattr(new, "OCR_MAX_WIDTH", 16)
+    monkeypatch.setattr(new, "OCR_QUALITY_CHECK", True)
+    monkeypatch.setattr(new, "_ocr_available", lambda: True)
+    monkeypatch.setattr(new.tempfile, "gettempdir", lambda: str(tmp_path))
+    original = np.random.default_rng(42).integers(0, 256, (24, 32, 3), dtype=np.uint8)
+    inputs = []
+
+    class Source:
+        def capture_still(self):
+            return original
+
+        def peek_latest(self):
+            return original
+
+    class Proc:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            inputs.append(input)
+            return b"", b""
+
+    monkeypatch.setattr(new.subprocess, "Popen", lambda *a, **k: Proc())
+    return Source(), original, inputs
+
+
+def test_ocr_dump_off_writes_nothing(new, monkeypatch, tmp_path, dump_reader):
+    source, _original, inputs = dump_reader
+    monkeypatch.setattr(new, "OCR_DUMP_ONCE", False)
+    _capture_speech(new, monkeypatch)
+    new._perform_ocr_read(source)
+    assert len(inputs) == 1
+    assert list(tmp_path.iterdir()) == []
+    assert new._ocr_dump_attempted is False
+
+
+def test_ocr_dump_only_first_image(new, monkeypatch, tmp_path, dump_reader):
+    source, _original, inputs = dump_reader
+    _capture_speech(new, monkeypatch)
+    new._perform_ocr_read(None)  # No image must not consume the one shot.
+    assert new._ocr_dump_attempted is False
+    new._perform_ocr_read(source)
+    first_pair = {path: path.read_bytes() for path in tmp_path.rglob("*.png")}
+    assert len(first_pair) == 2
+    new._perform_ocr_read(source)
+    assert len(inputs) == 2
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*.png")} == first_pair
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+@pytest.mark.parametrize("result", ["empty", "low-confidence"])
+def test_ocr_dump_pair_survives_rejection(
+    new, monkeypatch, tmp_path, capsys, dump_reader, result
+):
+    source, original, inputs = dump_reader
+    spoken = _capture_speech(new, monkeypatch)
+    if result == "low-confidence":
+        monkeypatch.setattr(
+            new, "_parse_tesseract_tsv",
+            lambda output: _ocr_result(new, "the words on this page", conf=44.0),
+        )
+    new._perform_ocr_read(source)
+    original_path, = tmp_path.rglob("*-original.png")
+    input_path, = tmp_path.rglob("*-tesseract-input.png")
+    attempt = original_path.parent.name
+    assert original_path.name == f"{attempt}-still-original.png"
+    assert input_path.name == f"{attempt}-still-tesseract-input.png"
+    assert np.array_equal(new.cv2.imread(str(original_path)), original)
+    assert input_path.read_bytes() == inputs[0]  # Exact bytes sent to Tesseract.
+    assert new.cv2.imread(str(input_path)).shape == (12, 16, 3)
+    expected = (
+        "I don't see any text." if result == "empty"
+        else "I couldn't read the page. Hold it steady and try again."
+    )
+    assert spoken == [(2, expected)]
+    log = capsys.readouterr().out
+    for value in ("source=still", "original=32x24", "input=16x12",
+                  str(original_path.resolve()), str(input_path.resolve())):
+        assert value in log
+
+
+@pytest.mark.parametrize("failure", ["none", "exception"])
+def test_ocr_dump_labels_still_fallback_as_preview(
+    new, monkeypatch, tmp_path, capsys, dump_reader, failure
+):
+    source, _original, _inputs = dump_reader
+    _capture_speech(new, monkeypatch)
+
+    def failed_still():
+        if failure == "exception":
+            raise RuntimeError("camera busy")
+        return None
+
+    monkeypatch.setattr(source, "capture_still", failed_still)
+    new._perform_ocr_read(source)
+    paths = list(tmp_path.rglob("*.png"))
+    assert len(paths) == 2
+    assert all("-preview-peek-" in path.name for path in paths)
+    assert "source=preview-peek" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure", ["original", "input", "git-temp"])
+def test_ocr_dump_write_failure_keeps_ocr_running(
+    new, monkeypatch, tmp_path, capsys, dump_reader, failure
+):
+    source, _original, inputs = dump_reader
+    spoken = _capture_speech(new, monkeypatch)
+    if failure == "original":
+        monkeypatch.setattr(new.cv2, "imwrite", lambda *a: False)
+    elif failure == "input":
+        def fail_write(*args):
+            raise OSError("disk full")
+        monkeypatch.setattr(new.Path, "write_bytes", fail_write)
+    else:
+        (tmp_path / ".git").mkdir()
+    new._perform_ocr_read(source)
+    new._perform_ocr_read(source)
+    assert len(inputs) == 2
+    assert spoken == [(2, "I don't see any text.")] * 2
+    assert new._ocr_dump_attempted is True
+    log = capsys.readouterr().out
+    assert log.count("failed:") == 1  # Failed writes also consume the one shot.
+    if failure == "git-temp":
+        assert list(tmp_path.rglob("*.png")) == []
+        assert "outside Git working trees" in log

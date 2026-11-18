@@ -632,6 +632,10 @@ OCR_STILL_WIDTH = int(os.environ.get("WHISPER_HAT_OCR_STILL_WIDTH", "1920"))
 OCR_STILL_HEIGHT = int(os.environ.get("WHISPER_HAT_OCR_STILL_HEIGHT", "1440"))
 OCR_MAX_WIDTH = int(os.environ.get("WHISPER_HAT_OCR_MAX_WIDTH", "1024"))
 OCR_STILL_CAPTURE_WAIT_SECONDS = 8.0
+# Local diagnostic only: one original/input pair, outside the checkout.
+OCR_DUMP_ONCE = os.environ.get(
+    "WHISPER_HAT_OCR_DUMP_ONCE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 OCR_READ_PHRASES = (
     "read this",
     "read that",
@@ -965,6 +969,7 @@ current_ocr_process = None
 current_ocr_process_lock = threading.Lock()
 _ocr_available_cache = None
 _ocr_missing_warned = False
+_ocr_dump_attempted = False
 
 # Generic "unknown obstacle" temporal state. Kept separate from the raw ToF
 # snapshot so a stationary obstacle does not jump between risk bands.
@@ -4286,13 +4291,57 @@ def _parse_tesseract_tsv(output):
     return text, word_rows, metrics
 
 
-def _run_tesseract_command(frame, extra_args=None):
+def _begin_ocr_dump(frame, origin):
+    """Save the untouched capture once; return its matching input PNG path."""
+    global _ocr_dump_attempted
+    if not OCR_DUMP_ONCE or _ocr_dump_attempted or frame is None:
+        return None
+    # ponytail: one serial OCR worker; add a lock if reads become concurrent.
+    # Consume the attempt even if a write fails.
+    _ocr_dump_attempted = True
+    source = "still" if origin == "still" else f"preview-{origin}"
+    try:
+        root = Path(tempfile.gettempdir()).resolve()
+        if any((parent / ".git").exists() for parent in (root, *root.parents)):
+            raise ValueError("OCR dump directory must be outside Git working trees")
+        # mkdtemp keeps captures private and distinct across app runs.
+        directory = Path(tempfile.mkdtemp(prefix="whisper-hat-ocr-", dir=root))
+        attempt = directory.name
+        original_path = directory / f"{attempt}-{source}-original.png"
+        input_path = directory / f"{attempt}-{source}-tesseract-input.png"
+        if not cv2.imwrite(str(original_path), frame):
+            raise OSError(f"could not write {original_path}")
+        height, width = frame.shape[:2]
+        print(
+            f"[ocr dump] attempt={attempt} source={source} "
+            f"original={width}x{height} path={original_path}",
+            flush=True,
+        )
+        return input_path
+    except Exception as error:
+        print(f"[ocr dump] original failed: {type(error).__name__}: {error}", flush=True)
+        return None
+
+
+def _run_tesseract_command(frame, extra_args=None, dump_path=None):
     """Encode the frame as PNG and pipe it through Tesseract."""
     global current_ocr_process
     ok, buffer = cv2.imencode(".png", frame)
     if not ok:
         raise RuntimeError("could not encode frame for OCR")
     png_bytes = buffer.tobytes()
+    if dump_path is not None:
+        try:
+            # Preserve the exact stdin payload, without a second image encode.
+            dump_path.write_bytes(png_bytes)
+            height, width = frame.shape[:2]
+            print(
+                f"[ocr dump] attempt={dump_path.parent.name} "
+                f"input={width}x{height} path={dump_path}",
+                flush=True,
+            )
+        except Exception as error:
+            print(f"[ocr dump] input failed: {type(error).__name__}: {error}", flush=True)
 
     command = [
         OCR_BINARY, "stdin", "stdout",
@@ -4331,9 +4380,9 @@ def _run_tesseract(frame):
     return _run_tesseract_command(frame)
 
 
-def _run_tesseract_tsv(frame):
+def _run_tesseract_tsv(frame, dump_path=None):
     """TSV Tesseract call with word confidences for the quality gate."""
-    output = _run_tesseract_command(frame, ["tsv"])
+    output = _run_tesseract_command(frame, ["tsv"], dump_path=dump_path)
     return _parse_tesseract_tsv(output)
 
 
@@ -4360,6 +4409,7 @@ def _perform_ocr_read(source):
         return
 
     frame = _grab_ocr_frame(source)
+    dump_path = _begin_ocr_dump(frame, ocr_frame_origin)
     original_shape = None if frame is None else frame.shape
     original_metrics = _ocr_frame_metrics(frame)
     frame = _prepare_ocr_frame(frame)
@@ -4382,7 +4432,10 @@ def _perform_ocr_read(source):
         return
 
     try:
-        raw_text, words, metrics = _run_tesseract_tsv(frame)
+        if dump_path is None:
+            raw_text, words, metrics = _run_tesseract_tsv(frame)
+        else:
+            raw_text, words, metrics = _run_tesseract_tsv(frame, dump_path=dump_path)
     except Exception as error:
         _voice_debug("ocr_failed", error=f"{type(error).__name__}: {error}")
         _play_direct_response(
