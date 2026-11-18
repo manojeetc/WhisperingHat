@@ -915,6 +915,90 @@ before proposing a default wait. Until the Pi runs this probe, neither a focus
 reset nor the benefit/cost of waiting has been verified. Keep the unmirror and
 quality gate unchanged; microphone recovery remains a separate investigation.
 
+#### Offline region selection experiment (normal app unchanged)
+
+The Pi probe at `baf3e56` produced readable left-to-right bag lettering in both
+Tesseract inputs, but PSM 3 found no words. The reported preview gaps were about
+0.33 s immediate and 0.74 s after the explicit AF cycle, without a full-frame
+OCR improvement. Do not add that AF cycle to live capture for this experiment.
+
+`ocr_region_compare.py` accepts an **already correctly oriented saved image**;
+it never flips it. It compares full-frame PSM 3/6/7/11, a fixed 70% center crop
+with PSM 6/7, and one automatic region with PSM 6/7. The automatic method uses
+OpenCV blackhat/threshold/closing, rotated contour rectangles, and a geometric
+score favoring central horizontal text lines. It rectifies that rectangle at
+its estimated native dimensions. Crops get an 8-pixel white margin. Selection
+never uses expected words, manual coordinates, or OCR confidence.
+
+This is one dark-on-light **line** hypothesis, not a page-layout model. Texture
+can win; light-on-dark text, strong perspective, and multi-line blocks can be
+missed. Running PSM 6 on a line does not establish paragraph reading. Sparse
+PSM 11 is only a comparison and must not authorize reading the whole scene.
+
+Each run creates a private `ocr-regions-<id>` directory under `--output`, outside
+Git. It saves `center.png`, `automatic.png` if found, optional
+`manual-control.png`, a colored region overlay, and `report.json`. Every OCR
+attempt records the selected quadrilateral, actual text and words, PSM, engine,
+selection time, OCR time, and their sum. Timing excludes shared input decoding,
+artifact writes, and human manual selection; it includes engine initialization.
+Empty detection and engine errors are explicit. No images are uploaded.
+
+On Windows, Tesseract 5.5.4 through tesserocr 2.13.0 with English tessdata_fast
+reproduced the immediate manual control as **`SNACK FACTORY]`**: both words,
+plus a wrong trailing bracket. Full-frame PSM 3 returned no words for both bag
+shots. PSM 11 mixed fragments with junk; the immediate shot included `Cancer`
+from the poster and `SNACK FACTOR` (missing Y). Center PSM 6 still included the
+poster and junk. The automatic immediate crop selected foreground `PARTY SIZE`
+but recovered no words with PSM 6 or 7. The settled crop selected lower bag
+lettering/artwork/texture and PSM 6 returned `Sn ie` / `“seco`, not the brand
+line. **Automatic selection did not reliably beat the baseline and is not
+connected to “read this.”** Single Windows totals included 160.8/155.3 ms for
+immediate/settled full PSM 3, 209.2/177.9 ms for center PSM 6, and 35.1/43.7 ms
+for automatic PSM 7. These are not Pi performance measurements.
+
+The newer book input `whisper-hat-ocr-k40ie7yb-still-tesseract-input.png` and its
+1920x1440 original are blurry and partly occluded. Its offline run produced
+only junk; a trustworthy printed paragraph could not be transcribed from it.
+The older book frame is clipped and unevenly lit. **Flat-book paragraph
+accuracy, omissions, and line-order validation remain pending**, not a pass
+based on confidence or sharpening. No preprocessing/resolution/AF change is
+justified by these offline results.
+
+Exact Windows PowerShell rerun (from this checkout, with uv Python 3.12):
+
+```powershell
+Set-Location C:\Users\manoj\WhisperingHat
+$ocrDataDir = Join-Path $env:TEMP 'whisper-ocr-tessdata'
+New-Item -ItemType Directory -Force -Path $ocrDataDir | Out-Null
+Invoke-WebRequest 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/eng.traineddata' -OutFile (Join-Path $ocrDataDir 'eng.traineddata')
+$ocrImages = Join-Path $env:USERPROFILE 'Downloads\whisper-hat-focus-0bgcherh'
+$ocrCommon = @('--output', "$env:USERPROFILE\Downloads\whisper-ocr-regions", '--engine', 'tesserocr', '--tessdata', $ocrDataDir)
+
+# Manual coordinates are only an explicit control on this one saved image.
+uv run --no-project --python 3.12 --with 'opencv-python<5' --with 'tesserocr==2.13.0' python .\ocr_region_compare.py "$ocrImages\whisper-hat-focus-0bgcherh-immediate-tesseract-input.png" @ocrCommon --manual-quad 395 263 695 304 689 349 389 308
+uv run --no-project --python 3.12 --with 'opencv-python<5' --with 'tesserocr==2.13.0' python .\ocr_region_compare.py "$ocrImages\whisper-hat-focus-0bgcherh-settled-tesseract-input.png" @ocrCommon
+
+# Available blurry book: diagnostic output only, paragraph test still pending.
+uv run --no-project --python 3.12 --with 'opencv-python<5' --with 'tesserocr==2.13.0' python .\ocr_region_compare.py "$env:USERPROFILE\Downloads\whisper-hat-ocr-k40ie7yb-still-tesseract-input.png" @ocrCommon
+```
+
+The download supplies public English model data only; photographs stay local.
+The default `--engine cli` instead uses an installed `tesseract` executable,
+so the Pi can use its existing OCR dependencies without tesserocr. Record the
+engine/model when comparing platforms; Windows output does not prove Pi output.
+
+For a new sharp, flat page, transcribe at least one actual printed paragraph
+into a UTF-8 file outside Git, one physical printed line per line, then add
+`--reference C:\path\printed-paragraph.txt` to its comparison command. The
+report includes normalized word insertions/deletions/substitutions, each
+reference line's exact-word position when found, and whether those matched
+lines were reordered. Order is assessable only with two or more exact matches.
+Line wrapping is ignored; an unmatched line means no
+exact match, not proof the entire line is missing. Inspect the crop and compare
+the raw text to the printed paragraph, including omitted and reordered lines.
+Until that sharp image/reference exists and selection works across scenes,
+keep the live quality gate and normal app behavior unchanged.
+
 #### Broader OCR and interruption matrix (after image inspection)
 
 Use a real book page, not a synthetic screenshot. Run with the detection stream
