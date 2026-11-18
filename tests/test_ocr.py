@@ -9,6 +9,7 @@ microphone recognition of the new phrases must be verified on the Pi.
 import json
 import subprocess
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -667,3 +668,72 @@ def test_ocr_dump_write_failure_keeps_ocr_running(
     if failure == "git-temp":
         assert list(tmp_path.rglob("*.png")) == []
         assert "outside Git working trees" in log
+
+
+@pytest.mark.parametrize("origin", ["still", "peek", "read"])
+@pytest.mark.parametrize("mirrored", [False, True])
+def test_ocr_unmirrors_once_without_changing_capture(
+    new, monkeypatch, tmp_path, dump_reader, origin, mirrored
+):
+    source, original, inputs = dump_reader
+    source.ocr_mirrored = mirrored
+    before = original.copy()
+    monkeypatch.setattr(new, "OCR_USE_STILL", origin == "still")
+    if origin == "read":
+        monkeypatch.setattr(source, "peek_latest", lambda: None)
+        monkeypatch.setattr(source, "read", lambda: (True, original), raising=False)
+    _capture_speech(new, monkeypatch)
+    new._perform_ocr_read(source)
+    decoded = new.cv2.imdecode(np.frombuffer(inputs[0], dtype=np.uint8), new.cv2.IMREAD_COLOR)
+    expected = new.cv2.resize(
+        before[:, ::-1] if mirrored else before,
+        (16, 12), interpolation=new.cv2.INTER_AREA,
+    )
+    assert np.array_equal(decoded, expected)  # Catches missing/double flips.
+    assert np.array_equal(original, before)   # Shared detection pixels untouched.
+    original_path, = tmp_path.rglob("*-original.png")
+    assert np.array_equal(new.cv2.imread(str(original_path)), before)
+    input_path, = tmp_path.rglob("*-tesseract-input.png")
+    assert input_path.read_bytes() == inputs[0]
+    # Also exercise the no-resize path, which used to return the source array.
+    monkeypatch.setattr(new, "OCR_MAX_WIDTH", 32)
+    assert np.array_equal(
+        new._prepare_ocr_frame(original, unmirror=mirrored),
+        before[:, ::-1] if mirrored else before,
+    )
+    assert np.array_equal(original, before)
+
+
+@pytest.mark.parametrize("hflip,vflip", [(False, True), (False, False), (True, True), (True, False)])
+def test_picamera_mirror_metadata_preserves_preview_and_still_transform(
+    new, monkeypatch, hflip, vflip
+):
+    captured = {}
+    frame = _frame()
+    camera = SimpleNamespace(
+        camera_properties={},
+        create_preview_configuration=lambda **kw: captured.setdefault("preview", kw),
+        create_still_configuration=lambda **kw: captured.setdefault("still", kw),
+        configure=lambda config: None,
+        start=lambda: None,
+        capture_array=lambda name: frame,
+        switch_mode_and_capture_array=lambda config, name: frame,
+    )
+    monkeypatch.setitem(new.sys.modules, "picamera2", SimpleNamespace(Picamera2=lambda **kw: camera))
+    monkeypatch.setitem(new.sys.modules, "libcamera", SimpleNamespace(
+        Transform=lambda **kw: kw, controls=SimpleNamespace(),
+    ))
+    monkeypatch.setattr(new, "CAMERA_HFLIP", hflip)
+    monkeypatch.setattr(new, "CAMERA_VFLIP", vflip)
+    monkeypatch.setattr(new, "CAMERA3_AF_MODE", "off")
+    monkeypatch.setattr(new.time, "sleep", lambda duration: None)
+    source = new.Picamera2Source()
+    assert source.ocr_mirrored == (hflip != vflip)
+    assert source.read()[1] is frame
+    assert source.capture_still() is frame
+    assert captured["preview"]["transform"] == {"hflip": int(hflip), "vflip": int(vflip)}
+    assert captured["still"]["transform"] is captured["preview"]["transform"]
+    # The standard newest-frame wrapper must pass through the OCR metadata.
+    monkeypatch.setattr(new.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: None))
+    wrapped = new.LatestFrameSource(source)
+    assert wrapped.ocr_mirrored == source.ocr_mirrored

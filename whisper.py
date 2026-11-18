@@ -4062,10 +4062,12 @@ def _split_ocr_speech_chunks(text):
     return [chunk for chunk in chunks if chunk]
 
 
-def _prepare_ocr_frame(frame):
-    """Resize a still/read frame down to the OCR working width."""
+def _prepare_ocr_frame(frame, unmirror=False):
+    """Correct OCR handedness once, then resize to the working width."""
     if frame is None:
         return None
+    if unmirror:
+        frame = cv2.flip(frame, 1)
     height, width = frame.shape[:2]
     if width <= OCR_MAX_WIDTH or width <= 0:
         return frame
@@ -4412,11 +4414,12 @@ def _perform_ocr_read(source):
     dump_path = _begin_ocr_dump(frame, ocr_frame_origin)
     original_shape = None if frame is None else frame.shape
     original_metrics = _ocr_frame_metrics(frame)
-    frame = _prepare_ocr_frame(frame)
+    frame = _prepare_ocr_frame(frame, unmirror=getattr(source, "ocr_mirrored", False))
     _voice_debug(
         "ocr_frame",
         elapsed_s=round(time.monotonic() - started, 3),
         frame_origin=ocr_frame_origin,
+        ocr_unmirrored=bool(getattr(source, "ocr_mirrored", False)),
         original_shape=original_shape,
         ocr_shape=None if frame is None else frame.shape,
         original_blur_score=original_metrics.get("blur_score"),
@@ -5442,6 +5445,7 @@ class LatestFrameSource:
 
     def __init__(self, source):
         self.source = source
+        self.ocr_mirrored = getattr(source, "ocr_mirrored", False)
         self.condition = threading.Condition()
         self.latest_frame = None
         self.sequence = 0
@@ -5610,6 +5614,9 @@ class Picamera2Source:
 
         self.picam2.configure(config)
         self.transform = transform
+        # One camera-axis reflection mirrors text. Keep the detection feed as
+        # configured; only the OCR copy receives a horizontal correction.
+        self.ocr_mirrored = bool(CAMERA_HFLIP) != bool(CAMERA_VFLIP)
         self.still_config = None
         self.io_lock = threading.Lock()
 

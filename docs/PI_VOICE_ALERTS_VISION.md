@@ -798,6 +798,41 @@ inactive, so playback overlap alone cannot explain it. Preserve the preceding
 state, for a separate investigation. This image-dump patch does not change the
 recognizer or microphone recovery.
 
+#### Mirror finding from saved pair `g0m114ny`
+
+Both saved PNGs are horizontally mirrored. The 1024x768 input matches an
+`INTER_AREA` resize of the 1920x1440 original pixel for pixel, so OCR resizing
+did not introduce the reflection. `Picamera2Source` configures preview and
+still capture with the same `Transform(hflip=False, vflip=True)`. That single
+axis reflection reverses handedness; with this camera mounting, the resulting
+text is upright but horizontally mirrored.
+
+OCR now receives the capture's reflection metadata through `LatestFrameSource`.
+`_prepare_ocr_frame` applies `cv2.flip(frame, 1)` once to the OCR copy when the
+camera transform has an odd number of axis reflections, before the existing
+resize. Sources without this reflection are unchanged. The original dump stays
+untouched; the input dump still contains the exact Tesseract bytes. Camera
+transforms, shared detection pixels, left/right obstacle cues, and the quality
+gate are unchanged. `ocr_frame ocr_unmirrored=True` records the correction.
+
+Local Windows comparison of this saved input used native Tesseract 5.5.4 via
+tesserocr, English `tessdata_fast`, PSM 3, and the same 1024x768 pixels except
+for the horizontal flip. **Both as-is and flipped returned zero nonblank words**;
+neither recovered the visible heading "The Call of the Wild" or the phrase
+"the sweep of the current". A whitespace-only TSV token with confidence 95 is
+not a recognized word. A known-text sanity check passed using the same engine.
+The Pi engine version/traineddata were not available for matching, so this is
+a Windows result, not a Pi accuracy claim.
+
+The photographed book occupies the lower portion of a cluttered scene, is
+clipped by the bottom edge, and has strong sunlight/shadow bands across its
+text. The next Pi run should use the command above, **one complete page
+centered and filling most of the frame under even lighting**, while stationary
+with the boot service stopped. Check the untouched original against the
+corrected input and compare recognized words against the page. Do this before
+tuning resolution, cropping, segmentation, or quality thresholds. The mirror
+correction is established; successful full-page reading still needs a Pi test.
+
 #### Broader OCR and interruption matrix (after image inspection)
 
 Use a real book page, not a synthetic screenshot. Run with the detection stream
