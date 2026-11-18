@@ -440,6 +440,9 @@ TOF_ASSOCIATION_DEBUG_INTERVAL_SECONDS = 1.0
 ALERT_TRACE = os.environ.get("WHISPER_HAT_ALERT_TRACE", "0").strip().lower() in {
     "1", "true", "yes", "on"
 }
+NAMING_CAPTURE_ENABLED = os.environ.get("WHISPER_HAT_NAMING_CAPTURE", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 # Unknown-obstacle warnings are powerful but should only be enabled after the
 # ToF is rigidly mounted and its central path region is verified.
@@ -5826,15 +5829,26 @@ def extract_detections(results, names):
     return detections
 
 
-def name_tof_obstacle(model, frame, distance_m, snapshot, overlap):
-    """Name an already-approved ToF warning; never score or suppress a hazard."""
-    results = model.predict(
-        frame, verbose=False, conf=CONFIDENCE, imgsz=DETECTION_IMG_SIZE,
-        device=DEVICE, classes=None, save=False,
+def naming_replay_config():
+    keys = (
+        "ENABLE_TOF", "TOF_MOUNT_CALIBRATED", "TOF_STALE_SECONDS",
+        "TOF_OVERLAP_WIDTH_FRACTION", "TOF_OVERLAP_HEIGHT_FRACTION",
+        "TOF_OVERLAP_CENTER_X_OFFSET", "TOF_OVERLAP_CENTER_Y_OFFSET",
+        "TOF_BOX_X_INSET_FRACTION", "TOF_BOX_Y_START_FRACTION", "TOF_CELL_PADDING",
+        "TOF_MIN_VALID_CELLS", "TOF_DISTANCE_PERCENTILE", "TOF_BOX_CLAMP_LOW_OBJECTS",
+        "TOF_UNKNOWN_MATCH_TOLERANCE_M", "USE_WALKING_CORRIDOR", "CORRIDOR_TOP_Y",
+        "CORRIDOR_TOP_LEFT", "CORRIDOR_TOP_RIGHT", "CORRIDOR_BOTTOM_LEFT", "CORRIDOR_BOTTOM_RIGHT",
+        "DISTANCE_MODE", "DISTANCE_CALIBRATION", "REFERENCE_HEIGHT_M", "FOCAL_LENGTH_PX",
+        "MIN_FAKE_DISTANCE_M", "MAX_FAKE_DISTANCE_M", "CONFIDENCE",
     )
-    height, width = frame.shape[:2]
+    return {key: globals()[key] for key in keys}
+
+
+def evaluate_obstacle_names(detections, width, height, distance_m, snapshot, overlap):
+    """Shared live/offline naming rules; no hazard or temporal-state updates."""
     best = None
-    for label, conf, x1, y1, x2, y2, _ in extract_detections(results, model.names):
+    candidates = []
+    for label, conf, x1, y1, x2, y2, _ in detections:
         inside, _ = corridor_geometry_for_point((x1 + x2) / 2, y2, width, height)
         diagnostics = {}
         match = tof_distance_for_box(
@@ -5848,18 +5862,40 @@ def name_tof_obstacle(model, frame, distance_m, snapshot, overlap):
         accepted = conf >= CONFIDENCE and inside and not unknown_is_separate_from_known(
             distance_m, candidate_m, float("inf"),
         )
-        if ALERT_TRACE:
-            print(
-                f"[obstacle naming] class={label} conf={conf:.2f} "
-                f"box=({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) in_path={inside} "
-                f"source={source} distance={candidate_m:.2f}m "
-                f"tof_reason={diagnostics.get('reason')} accepted={accepted}", flush=True,
-            )
+        candidates.append(dict(label=label, confidence=float(conf), xyxy=[float(v) for v in (x1, y1, x2, y2)],
+                               in_corridor=bool(inside), distance_m=float(candidate_m), source=source,
+                               accepted=bool(accepted), tof_diagnostics=diagnostics))
         if accepted:
             candidate = (candidate_m, -conf, label)
             if best is None or candidate < best:
                 best = candidate
-    return None if best is None else best[2]
+    return dict(selected_name=None if best is None else best[2], candidates=candidates)
+
+
+def name_tof_obstacle(model, frame, distance_m, snapshot, overlap, diagnostics=None):
+    """Name an already-approved ToF warning; never score or suppress a hazard."""
+    started = time.perf_counter() if diagnostics is not None else None
+    results = model.predict(
+        frame, verbose=False, conf=CONFIDENCE, imgsz=DETECTION_IMG_SIZE,
+        device=DEVICE, classes=None, save=False,
+    )
+    height, width = frame.shape[:2]
+    evaluation = evaluate_obstacle_names(extract_detections(results, model.names), width, height,
+                                         distance_m, snapshot, overlap)
+    if diagnostics is not None:
+        diagnostics.update(evaluation)
+        diagnostics["prediction_and_match_ms"] = (time.perf_counter() - started) * 1000
+        predictor = getattr(model, "predictor", None)
+        diagnostics["resolved_imgsz"] = getattr(predictor, "imgsz", None)
+    for row in evaluation["candidates"]:
+        if ALERT_TRACE:
+            print(
+                f"[obstacle naming] class={row['label']} conf={row['confidence']:.2f} "
+                f"box={row['xyxy']} in_path={row['in_corridor']} "
+                f"source={row['source']} distance={row['distance_m']:.2f}m "
+                f"tof_reason={row['tof_diagnostics'].get('reason')} accepted={row['accepted']}", flush=True,
+            )
+    return evaluation["selected_name"]
 
 
 def _load_open_vocab_model():
@@ -5964,6 +6000,40 @@ def main():
     except Exception as exc:
         print(f"[obstacle naming] initialization failed; using fallback: {exc}", flush=True)
         obstacle_naming_model = None
+    naming_capture = None
+    capture_shapes, capture_hooks = {}, []
+    if NAMING_CAPTURE_ENABLED:
+        try:
+            from naming_capture import NamingCapture
+            naming_capture = NamingCapture(
+                os.environ.get("WHISPER_HAT_NAMING_CAPTURE_DIR", str(Path(tempfile.gettempdir()) / "whisper-naming-captures")),
+                int(os.environ.get("WHISPER_HAT_NAMING_CAPTURE_LIMIT", "5")),
+            )
+            for pass_kind, detector in (("separate_naming", obstacle_naming_model), ("legacy_tracking", model)):
+                if hasattr(detector, "add_callback"):
+                    def attach_shape(predictor, kind=pass_kind):
+                        try:
+                            core = getattr(predictor.model, "model", None)
+                            if kind not in capture_shapes and hasattr(core, "register_forward_pre_hook"):
+                                capture_shapes[kind] = None
+                                def record_shape(module, inputs):
+                                    try:
+                                        capture_shapes[kind] = [int(value) for value in inputs[0].shape]
+                                    except Exception:
+                                        capture_shapes[kind] = None
+                                capture_hooks.append(core.register_forward_pre_hook(record_shape))
+                        except Exception as exc:
+                            capture_shapes[kind] = None
+                            print(f"[naming capture] tensor shape unavailable: {exc}", flush=True)
+                    detector.add_callback("on_predict_start", attach_shape)
+        except Exception as exc:
+            print(f"[naming capture] disabled: {exc}", flush=True)
+            if naming_capture is not None:
+                naming_capture.close()
+                naming_capture = None
+            for hook in capture_hooks:
+                hook.remove()
+            capture_hooks.clear()
 
     print("Opening source...")
     source = open_source()
@@ -5975,6 +6045,10 @@ def main():
         print("  rpicam-hello -t 5000 --autofocus-mode continuous")
         print("If those fail, check the 22-pin Pi 5 camera cable orientation and connector latch.")
         stop_tof_worker()
+        if naming_capture is not None:
+            naming_capture.close()
+        for hook in capture_hooks:
+            hook.remove()
         return
 
     print()
@@ -6002,6 +6076,9 @@ def main():
 
     frame_count = 0
     last_detections = None
+    last_detection_frame = None
+    last_detection_frame_number = None
+    last_detection_time = None
 
     prev_time = time.time()
     fps = 0.0
@@ -6063,6 +6140,7 @@ def main():
             emotion_speech_candidates = []
             nearest_matched_tof_m = float("inf")
             nearest_known_object_m = float("inf")
+            captured_candidates = [] if naming_capture is not None else None
 
             # Take one ToF snapshot and overlap rectangle per frame and share
             # them across the summary, overlay, every box, and the unknown
@@ -6078,6 +6156,10 @@ def main():
 
             # Display overlays below mutate frame; naming must see camera pixels.
             naming_frame = frame.copy() if detection_enabled and SHOW_WINDOW else frame
+            if naming_capture is not None and detection_ran:
+                last_detection_frame = naming_frame.copy() if naming_frame is frame else naming_frame
+                last_detection_frame_number = frame_count
+                last_detection_time = now
             if SHOW_WINDOW:
                 draw_walking_corridor(frame)
                 if detection_enabled:
@@ -6132,6 +6214,10 @@ def main():
                         tof_snapshot=tof_snapshot,
                         tof_overlap=tof_overlap,
                     )
+                    if captured_candidates is not None:
+                        captured_candidates.append(dict(label=class_name, confidence=float(conf),
+                                                        xyxy=[float(v) for v in (x1, y1, x2, y2)],
+                                                        track_id=int(track_id), risk=risk, reason=reason, debug=debug.copy()))
 
                     if describe_requested:
                         scene_objects.append((
@@ -6407,16 +6493,19 @@ def main():
                     )
                 if approved:
                     spoken_reason = best_reason
+                    naming_details = {} if naming_capture is not None else None
                     if best_alert_key == "tof:unknown:in_path" and obstacle_naming_model is not None:
                         try:
                             label = name_tof_obstacle(
                                 obstacle_naming_model, naming_frame, best_distance_m,
-                                tof_snapshot, tof_overlap,
+                                tof_snapshot, tof_overlap, diagnostics=naming_details,
                             )
                             if label is not None:
                                 spoken_reason = best_reason.replace("unknown obstacle", label, 1)
                         except Exception as exc:
                             print(f"[obstacle naming] prediction failed; using fallback: {exc}", flush=True)
+                            if naming_details is not None:
+                                naming_details["error"] = str(exc)
                     message = alert_text(best_risk, spoken_reason)
                     if ALERT_TRACE:
                         print(f"[alert trace] spoken={message!r} hazard_reason={best_reason!r}", flush=True)
@@ -6440,6 +6529,36 @@ def main():
                                 last_alert_decision.get("repeat")
                             ),
                         )
+
+                        # Experiment-only I/O is queued AFTER the existing speech
+                        # dispatch. No extra inference, waiting, or live rule change.
+                        if naming_capture is not None:
+                            separate_naming = best_alert_key == "tof:unknown:in_path"
+                            capture_frame = naming_frame if separate_naming else last_detection_frame
+                            naming_predictor = getattr(obstacle_naming_model if separate_naming else model, "predictor", None)
+                            capture_metadata = dict(
+                                kind="whisper_naming_capture_v1",
+                                source="naming_frame_before_overlays" if separate_naming else "legacy_detection_frame_before_overlays",
+                                frame_number=frame_count, frame_size=[frame_width, frame_height],
+                                detection_frame_number=frame_count if separate_naming else last_detection_frame_number,
+                                captured_at=now if separate_naming else last_detection_time,
+                                decision_at=now, frame_perf=frame_perf, loop_gap_before_ms=dt * 1000,
+                                dispatch_after_frame_ms=(time.perf_counter() - frame_perf) * 1000,
+                                association_config=naming_replay_config(), tof_snapshot=tof_snapshot,
+                                hazard=dict(approved=True, risk=best_risk, reason=best_reason,
+                                            key=best_alert_key, distance_m=best_distance_m,
+                                            source=best_debug.get("distance_source")),
+                                naming=dict(model=OPEN_VOCAB_MODEL if OPEN_VOCAB_ENABLED else MODEL_NAME,
+                                            imgsz=DETECTION_IMG_SIZE, resolved_imgsz=getattr(naming_predictor, "imgsz", None),
+                                            tensor_shape=capture_shapes.get("separate_naming" if separate_naming else "legacy_tracking"),
+                                            selected_name=None if separate_naming else best_class_name,
+                                            pass_kind="separate_naming" if separate_naming else "legacy_tracking"),
+                                legacy_candidates=captured_candidates,
+                                spoken_message=message, speech_queued=bool(safety_message_queued), expected_names=None,
+                            )
+                            capture_metadata["naming"].update(naming_details or {})
+                            if capture_frame is not None:
+                                naming_capture.submit(capture_frame, capture_metadata)
 
                         if best_debug is not None:
                             log_row(
@@ -6506,6 +6625,10 @@ def main():
 
     finally:
         source.release()
+        if naming_capture is not None:
+            naming_capture.close()
+        for hook in capture_hooks:
+            hook.remove()
         stop_voice_control()
         print_voice_summary()
         stop_ocr_reader()

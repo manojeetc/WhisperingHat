@@ -69,6 +69,7 @@ def test_visual_association_fallback_uses_existing_rule(new, frozen_time, monkey
 @pytest.mark.parametrize("case,expected", [
     ("matched", "Caution. bed close in path."),
     ("overlays", "Caution. bed close in path."),
+    ("chair", "STOP. chair very close in path."),
     ("off_path", "Caution. unknown obstacle close in path."),
     ("empty", "Caution. unknown obstacle close in path."),
     ("prediction_error", "Caution. unknown obstacle close in path."),
@@ -85,6 +86,8 @@ def test_main_names_only_after_unchanged_tof_alert_approval(new, monkeypatch, ca
     monkeypatch.setattr(new, "DETECTION_CLASSES", new.YOLO_CLASSES_TO_KEEP)
     monkeypatch.setattr(new, "USE_TRACKING", True)
     monkeypatch.setattr(new, "ALERT_TRACE", True)
+    capture_enabled = case in {"matched", "overlays", "chair"}
+    monkeypatch.setattr(new, "NAMING_CAPTURE_ENABLED", capture_enabled)
     for setting in ("SHOW_WINDOW", "SPEAK_STARTUP_MESSAGE", "LOG_ALL_DETECTIONS",
                     "ENABLE_FACE_RECOGNITION", "ENABLE_EMOTION_RECOGNITION"):
         monkeypatch.setattr(new, setting, False)
@@ -106,7 +109,24 @@ def test_main_names_only_after_unchanged_tof_alert_approval(new, monkeypatch, ca
     # Synchronized fresh snapshot: only its grid varies across cases.
     snapshot = new.get_tof_snapshot()
     monkeypatch.setattr(new, "get_tof_snapshot", lambda: snapshot)
-    tracking_calls, naming_calls, approvals, speech = [], [], [], []
+    tracking_calls, naming_calls, approvals, speech, captures = [], [], [], [], []
+    import naming_capture
+
+    class FakeCapture:
+        closed = False
+
+        def __init__(self, *args):
+            assert capture_enabled
+
+        def submit(self, frame, metadata):
+            assert speech  # experiment I/O is strictly after speech dispatch
+            assert not frame.any()
+            captures.append(metadata)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(naming_capture, "NamingCapture", FakeCapture)
 
     class Detector:
         names = {56: "chair", 59: "bed"}
@@ -121,6 +141,8 @@ def test_main_names_only_after_unchanged_tof_alert_approval(new, monkeypatch, ca
             assert kwargs["classes"] == new.YOLO_CLASSES_TO_KEEP
             assert kwargs["conf"] == .4
             tracking_calls.append(camera.count)
+            if case == "chair":
+                return make_results([BOX], [.9], [56], [1])
             return []  # as before, the legacy whitelist excludes bed
 
         def predict(self, frame, **kwargs):
@@ -159,8 +181,12 @@ def test_main_names_only_after_unchanged_tof_alert_approval(new, monkeypatch, ca
     original_should_alert = new.should_alert
 
     def approve(key, risk, reason, distance_m=None):
-        assert key == UNKNOWN_KEY
-        assert reason == "unknown obstacle close in path"
+        if case == "chair" and key != UNKNOWN_KEY:
+            assert "chair" in key
+            assert reason == "chair very close in path"
+        else:
+            assert key == UNKNOWN_KEY
+            assert reason == "unknown obstacle close in path"
         assert distance_m == pytest.approx(.6)
         approved = original_should_alert(key, risk, reason, distance_m=distance_m)
         approvals.append((approved, key, risk, reason, distance_m))
@@ -179,12 +205,27 @@ def test_main_names_only_after_unchanged_tof_alert_approval(new, monkeypatch, ca
         if expected is None:
             assert not speech and not naming_calls and not approvals
         else:
-            assert speech == [(2, expected, UNKNOWN_KEY, pytest.approx(.6))]
-            assert len(naming_calls) == (0 if case == "clone_error" else 1)
+            approved_key = next(row[1] for row in approvals if row[0])
+            assert speech == [(3 if case == "chair" else 2, expected, approved_key, pytest.approx(.6))]
+            assert len(naming_calls) == (0 if case in {"clone_error", "chair"} else 1)
             assert sum(row[0] for row in approvals) == 1
-            assert new.track_memory[UNKNOWN_KEY]["last_reason"] == "unknown obstacle close in path"
-            assert new.unknown_obstacle_state["risk"] == 2
+            if case != "chair":
+                assert new.track_memory[UNKNOWN_KEY]["last_reason"] == "unknown obstacle close in path"
+                assert new.unknown_obstacle_state["risk"] == 2
             output = capsys.readouterr().out
             assert "[alert trace]" in output and repr(expected) in output
+        assert len(captures) == (1 if capture_enabled else 0)
+        if captures:
+            metadata = captures[0]
+            assert metadata["frame_size"] == [640, 480]
+            assert metadata["hazard"]["approved"]
+            assert metadata["naming"]["imgsz"] == new.DETECTION_IMG_SIZE
+            assert metadata["spoken_message"] == expected
+            if case == "chair":
+                assert metadata["source"] == "legacy_detection_frame_before_overlays"
+                assert metadata["detection_frame_number"] < metadata["frame_number"]
+                assert metadata["legacy_candidates"][0]["label"] == "chair"
+            else:
+                assert metadata["naming"]["candidates"][0]["label"] == "bed"
     finally:
         reset_state(new)

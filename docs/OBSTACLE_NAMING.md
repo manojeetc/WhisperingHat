@@ -1,5 +1,8 @@
 # ToF obstacle names from the loaded detector
 
+For capped exact-frame capture and the four-way offline comparison, see
+`YOLOE_PROBE.md`. The ambiguity experiment is offline only.
+
 An approved generic ToF warning can now use any label from the loaded YOLO11n
 model. There is no class whitelist or known-name set in the naming pass, and no
 special case for bed. Labels come from `model.names` via `extract_detections()`.

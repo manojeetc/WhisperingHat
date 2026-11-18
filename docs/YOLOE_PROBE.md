@@ -1,184 +1,134 @@
-# Offline obstacle naming comparison
+# Offline resolution/model naming comparison
 
-`yoloe_probe.py` compares the same original pixels in three passes:
+The default matrix is YOLO11n at 320, YOLO11n at 640, YOLO11m at 640, and the
+existing text-prompt `yoloe-11s-seg.pt` at 640. All receive the same decoded
+camera pixels, confidence .40, CPU, unfiltered classes and the existing naming
+association rules. Nano at both sizes separates resolution from model gains.
+YOLOE keeps its previous configurable five prompts; its vocabulary differs
+from COCO. No detector, confidence, hazard, speech or ambiguity policy changes
+are deployed by this comparison.
 
-1. YOLO11n with the live COCO class whitelist.
-2. The same YOLO11n without the whitelist, to reveal labels the app discards.
-3. Text-prompt YOLOE, defaulting to the officially supported small
-   `yoloe-11s-seg.pt` checkpoint and
-   `bed,chair,bag of chips,cardboard box,laundry basket`.
+## Capture the missing real frames
 
-This is a standalone experiment. Importing the existing extraction/geometry
-helpers does not start the app. It never calls tracking, risk scoring, alert
-arbitration, speech, camera, microphone, OCR, or autofocus workers. Naming
-results have no connection to hazard warnings. No live files/settings change.
+No exact alert frames are currently available. The earlier OCR/focus stills
+are not substitutes. Prioritize (1) bed edge, (2) the competing laptop/tv scene,
+(3) the correctly named chair, and (4) bag on counter outside the corridor.
+For the last case, retain an independently triggered central ToF warning so
+the off-path bag can be tested as a naming distractor. A scene with no approved
+hazard can provide raw detections, but cannot establish a spoken naming result.
 
-The later live naming change is documented in `OBSTACLE_NAMING.md`. This probe's
-`baseline_live` pass still describes the unchanged tracking/risk/scene filter;
-the separate, unfiltered naming pass only runs after a ToF warning is approved.
+Stop the boot service using its actual unit name before a stationary manual
+run. From `~/WhisperingHat`:
 
-## What currently produces an unknown warning
+```bash
+WHISPER_HAT_OPEN_VOCAB=0 WHISPER_HAT_NAMING_CAPTURE=1 \
+WHISPER_HAT_NAMING_CAPTURE_LIMIT=5 \
+WHISPER_HAT_NAMING_CAPTURE_DIR=/tmp/whisper-naming-captures \
+WHISPER_HAT_ALERT_TRACE=1 WHISPER_HAT_ASSOCIATION_DEBUG=1 \
+WHISPER_HAT_LATENCY_DEBUG=1 .venv/bin/python -u whisper.py
+```
 
-The inspected baseline is `whisper.py` at `f21faf7`:
+Capture is off by default. The limit is 5 pairs per app run, configurable from
+1 through 20. A background writer has a two-item queue; full queues drop new
+captures. Disk I/O and submission occur after existing speech dispatch. No
+extra inference is added. Optional in-memory copies and shape observers record
+the inputs to existing inference; debug writing still consumes resources.
 
-- `MODEL_PROFILES["baseline"]` is the tracked `yolo11n.pt`, `imgsz=320`,
-  `CONFIDENCE=0.40`, CPU. The probe explicitly selects that profile, regardless
-  of live model-profile environment overrides.
-- Picamera2 captures 640x480 RGB888 buffers used directly as OpenCV BGR, with
-  `CAMERA_HFLIP=False`, `CAMERA_VFLIP=True`. The shared detection image keeps
-  that transform. The OCR-only unmirror does not belong in this experiment.
-- Ultralytics preserves aspect with stride-aligned LetterBox, converts BGR to
-  RGB/BCHW, and scales FP32 pixels by 255. `conf`, `imgsz`, effective `iou`,
-  `max_det`, `rect`, and `half` are recorded in each result. In the measured
-  version, NMS defaults are `iou=.7`, `max_det=300`, `rect=True`, `half=False`.
-- Live `run_yolo()` uses persistent ByteTrack (`bytetrack.yaml`), every third
-  processed frame, reusing cached detections between calls. The probe uses
-  **predict**, since unrelated saved stills cannot supply tracker history.
-  It reproduces detector inputs/filtering, not complete live tracking output.
-- `YOLO_CLASSES_TO_KEEP` is
-  `[0,1,2,3,5,7,9,11,13,15,16,17,19,24,26,28,56]`.
-  **COCO bed is ID 59: the weights know this word, but the live filter removes
-  it.** An unfiltered bed box would prove a filtering problem for that frame.
-- `extract_detections()` retains the exact model label. `score_risk()` has
-  label-specific person/vehicle/animal/static-object branches. Static-object
-  naming also depends on distance, lower-frame relevance and corridor/motion
-  checks. **`bed` and exact `bag of chips` are absent from
-  `KNOWN_OBJECT_CLASSES`/the static set.** `chair`, `cardboard box` and
-  `laundry basket` are present. There is no synonym normalization. The generic
-  score branch can say "object close"; ToF time-to-collision overrides can
-  still insert a raw label. Missing set membership is not a universal ban on
-  speaking that label.
-- The literal **"unknown obstacle" comes from the ToF fallback**, not a YOLO
-  output class. `tof_unknown_path_distance()` needs enabled/calibrated/fresh
-  depth and at least two valid cells in central rows 2-7, columns 2-5; it takes
-  the median. The main loop smooths it (alpha .35) and applies .12 m risk
-  hysteresis. Invalid/unavailable depth does not create this candidate.
-- The nearest in-corridor ToF-associated detection can explain that reading
-  regardless of known-set membership. A camera-distance fallback explains it
-  only for in-corridor exact names in `KNOWN_OBJECT_CLASSES`.
-  `unknown_is_separate_from_known()` requires the smoothed unknown distance
-  plus .45 m to be nearer than both known-distance alternatives.
-- If still unexplained, `unknown_obstacle_risk()` uses .55/1.25/2.5 m
-  STOP/caution/notice thresholds. The candidate must win the main loop's
-  risk/distance arbitration. `should_alert()`, `alert_text()`, stabilization,
-  deduplication and the speech queue decide whether it is actually spoken.
+Each approved hazard saves a lossless PNG and matching JSON in a unique
+`whisper-naming-*` directory outside Git. Generic ToF alerts save the separate
+naming frame; legacy alerts such as chair save the detector frame that supplied
+the label. Cached detection age is explicit in `detection_frame_number` versus
+the decision's `frame_number`. The JSON contains an image hash, ToF grid and age,
+association/corridor/distance configuration, raw naming candidates and legacy
+candidate diagnostics, selected/spoken text, runtime model/imgsz/resolved size,
+and observed BCHW tensor shape. Unavailable tensor shapes are null, not guesses.
+Errors are logged without affecting speech. No images are uploaded.
 
-Thus a missed/low-confidence/misclassified detection, a filtered class, a box
-outside the walking corridor, failed depth association, or an unusable exact
-name can all leave the ToF fallback unexplained. A still alone cannot identify
-which path caused a particular historical utterance.
+The checkout defaults are raw 640x480 and requested `imgsz=320`; Pi environment
+overrides are unverified until a capture is retrieved. The comparison includes
+the checkout's configured size and every captured naming size as additional
+nano baselines if different from 320/640. `--live-imgsz` adds an explicit size.
 
-## Windows rerun
+Retrieve PNGs and JSONs together from Windows (replace the SSH host):
 
-From PowerShell (Python 3.12 is available through `uv`):
+```powershell
+scp -r PI_USER@PI_HOST:/tmp/whisper-naming-captures "$env:USERPROFILE\Downloads"
+```
+
+## Compare on Windows
 
 ```powershell
 Set-Location C:\Users\manoj\WhisperingHat
 uv run --no-project --python 3.12 `
   --with 'opencv-python<5' --with 'ultralytics==8.4.215' `
   --with 'git+https://github.com/ultralytics/CLIP.git@7ffa84b3bfa40c42ecc1c77147a855e69cb2dd40' `
-  python .\yoloe_probe.py `
-  "$env:USERPROFILE\Downloads\whisper-hat-focus-0bgcherh" `
-  "$env:USERPROFILE\Downloads\whisper-hat-ocr-g0m114ny-still-original.png" `
-  "$env:USERPROFILE\Downloads\whisper-hat-ocr-k40ie7yb-still-original.png" `
-  --checkpoint yoloe-11s-seg.pt `
-  --labels 'bed,chair,bag of chips,cardboard box,laundry basket' `
+  python .\yoloe_probe.py "$env:USERPROFILE\Downloads\whisper-naming-captures" `
   --cache "$env:TEMP\whisper-yoloe-cache" `
-  --output "$env:USERPROFILE\Downloads\whisper-yoloe-results" `
+  --output "$env:USERPROFILE\Downloads\whisper-naming-comparison" `
   --warmup 2 --repeats 5
 ```
 
-Replace the input arguments with a single original image or a folder of saved
-detector frames. Folders are searched recursively; `*-tesseract-input.*` files
-are skipped and reported. Other processed images cannot be detected by filename:
-the caller must supply originals. No flipping, cropping, OCR preprocessing or
-manual resizing is applied before either model's own preprocessing.
+A single original image is also accepted. Tesseract inputs are excluded.
+Capture sidecars load automatically; mismatched hashes/configuration/frame sizes
+are rejected. Use the same checkout/calibration/environment as capture.
+Images without approved ToF context show raw detections but naming is
+**not evaluated**, rather than counted as abstentions.
 
-The first setup downloads public packages/checkpoint/text encoder; subsequent
-cached runs perform image inference locally. Images are never sent to a service.
-Ultralytics' prompt encoder currently downloads about 572 MB in addition to the
-26.5 MB checkpoint; both stay in the private cache. A bare checkpoint filename
-can download an official asset; an explicit path must already exist. Use a
-text-prompt checkpoint, not a `-pf` variant. The official model list is at
-https://docs.ultralytics.com/models/yoloe/.
+Public model/encoder packages download during first setup; inference is local
+after caching. The new medium weights, existing YOLOE/encoder, photos, settings
+and outputs remain outside Git. The tracked nano weights are read in place.
 
-Each run creates a unique directory beneath `--output`, prints that directory,
-and saves `report.json` plus a three-panel comparison per frame. New weights,
-settings, encoder and annotations must be outside **any Git checkout**; the CLI
-rejects cache/output/checkpoint directories under Git. The pre-existing tracked
-baseline weight is read in place. Generated files and private photos are never
-added to the repo.
+Each run saves a grid of raw detections with current/guarded names and a JSON
+report containing boxes, confidence, actual tensor shapes, warmed wall-time
+samples and medians, naming eligibility/reasons, counts and artifact paths.
+The shared live naming helper is replayed with original hazard approval held
+fixed; no sensor/tracker/risk/speech-queue decision is invented or replayed.
+Legacy chair captures are a conditional naming-pass comparison, not a claim
+that the live app runs that separate pass on chair alerts.
 
-JSON includes original/checkpoint hashes, vocabulary, exact prompts, package
-versions, prediction arguments, label/confidence/original-pixel xyxy boxes and
-all warmed samples/median milliseconds. Each model gets two untimed warmups
-per frame and five timed calls. Times include preprocessing, prediction,
-postprocessing (including YOLOE masks) and Results creation, excluding loading,
-prompt encoding, annotation and disk I/O. Sequential host timings are subject
-to Windows load; they are **not Pi timings or live tracking throughput**.
+The experimental offline guard keeps the generic warning when the current
+winner has a different eligible label with IoU >= .75 and absolute confidence
+gap <= .10. These are explicit starting thresholds, not tuned results.
+`--ambiguity-iou` and `--ambiguity-score-gap` configure them. Other classes,
+disjoint boxes and ineligible/off-path candidates do not force abstention.
 
-## Partial app checks
+## Grade names independently of confidence
 
-Each candidate reports the actual class filter, exact known-set membership and
-walking-corridor geometry, reusing app helpers. Raw YOLO11n candidates are checked
-against the live whitelist even though its diagnostic pass disables that
-filter. YOLOE's prompt IDs are not COCO IDs: the proposed open-vocabulary path
-has no COCO whitelist. Camera-known-distance acceptance means eligibility only;
-camera distance and final warning acceptance are not inferred.
-
-Without synchronized sensor data, ToF association, unknown arbitration and
-spoken alerts explicitly say **not evaluated**. Optional `--context context.json`
-maps absolute image paths (or unique filenames) to objects with:
+Manually inspect each frame and supply acceptable exact hazard names using
+`--context labels.json`. It overlays sidecars without replacing sensor data:
 
 ```json
 {
-  "frame.png": {
-    "frame_size": [640, 480],
-    "association_config": {},
-    "tof_snapshot": {"grid_mm": [], "fresh": true, "age_seconds": 0.05}
-  }
+  "frame-000003.png": {"expected_names": ["bed"]},
+  "frame-000042.png": {"expected_names": ["chair"]},
+  "frame-000080.png": {"expected_names": []}
 }
 ```
 
-Replace `association_config` with the exact object from the report, verified
-against the capture's configuration, and `grid_mm` with the synchronized 8x8
-processed grid (positive millimetres; JSON null for invalid cells). Frame size
-must match. Do not reuse preview calibration for a still with a different field
-of view. Invalid/mismatched context is rejected. Real `tof_distance_for_box()`
-returns accepted/rejected with its reason/cells/distance; this isolated mapping
-does not imply a filtered detection would reach the main loop. Full temporal
-arbitration and speech remain not evaluated even with a grid.
+An empty list means generic wording is desired; null/missing means unlabeled.
+Use absolute image paths when basenames repeat across sessions. Counts separate
+correct names, wrong names, abstentions, unscored names, and not-evaluated frames.
+The report also counts wrong names prevented and correct names lost by the
+guard. Abstention means no label selected, not automatically a correct decision.
+Raw boxes are supplied for visual inspection; no detection mAP is claimed.
 
-## Next capture set and decision
+## What remains to measure
 
-Save original **640x480 detection-preview frames**, retaining the shared camera
-orientation, from the actual unknown-warning events. Do not substitute OCR
-inputs or assume the existing 1920x1440 stills reproduce those events.
+There is no real-frame winner yet. Synthetic fixtures validate plumbing and
+the guard's tradeoff, not recognition accuracy. Windows prediction timings
+exclude downloads, model/text initialization, drawing and file I/O; they include
+preprocessing and NMS/masks. They are not Pi timings or time to speech.
 
-- Bed: the actual edge-only view at an unknown warning, several nearby frames,
-  and a wider view of the same bed as a positive control. Include approach
-  angles/distances relevant to the hat and a bed-free view of the same path.
-- Snack bag: bag on a counter, then the identical counter/view with the bag
-  removed. The existing carpet/bunk-bed bag shots are smoke tests only.
-- Vocabulary checks: chair, cardboard box and laundry basket positives in the
-  walking path, plus a view without any of the five target objects. Include
-  background clutter so wrong-target boxes are visible.
-- Keep timestamps/alert log rows, exact model/settings, detection labels,
-  confidences, boxes and track IDs; contemporaneous ToF grid/freshness/age and
-  mount calibration; corridor/association diagnostics; smoothed known/unknown
-  distances, risk/arbitration and speech decisions. Record sensor distance and
-  expected object labels independently. Do not create depth/tracking data from
-  a photograph.
+Only after a model wins on the labeled real frames should it be benchmarked
+on the Pi as an isolated naming pass. Keep the live hazard model unchanged.
+Measure cold and warmed naming, matched hazard-to-TTS-start latency (existing
+`WHISPER_HAT_LATENCY_DEBUG`), and warning-loop frame-gap median/p95/max under
+the same scene/load with and without the candidate. Captures record naming
+duration, dispatch-after-frame time and preceding loop gap; these do not measure
+the next loop gap or acoustic onset. Check actual audible speech separately.
+Do not promote a model from offline speed or confidence alone.
 
-Inspect boxes against the foreground object and count misses/wrong labels on
-paired positives/negatives. If raw YOLO11n already detects the relevant bed,
-fix label filtering/matching first in a separate patch. If YOLOE consistently
-recovers useful correct names on that set, benchmark it on the Pi with the same
-frames and measure live frame gaps before considering integration. If neither
-condition is established, collect better test frames. Never let naming alone
-trigger or suppress a hazard warning.
-
-Tests (no weights or model downloads):
+Tests require no model downloads:
 
 ```powershell
 uv run --no-project --python 3.12 --with numpy --with 'opencv-python<5' --with pytest python -m pytest -q --tb=short
