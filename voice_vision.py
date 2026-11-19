@@ -37,16 +37,22 @@ def ordered_regions(boxes, texts, scores):
 
 
 def ocr_reliable(regions, shape=None):
+    return ocr_failure_reason(regions, shape) is None
+
+
+def ocr_failure_reason(regions, shape=None):
     # Unlike Tesseract's confidence scale, PP-OCR scores are in [0, 1].
-    if not regions or not all(r["text"].strip() and .80 <= r["confidence"] <= 1 for r in regions):
-        return False
+    if not regions:
+        return "no_text"
     # Edge-touching regions may contain confidently recognized, clipped words.
     if shape is not None:
         height, width = shape[:2]
         if any(x <= 1 or y <= 1 or x >= width - 2 or y >= height - 2
                for row in regions for x, y in row["box"]):
-            return False
-    return True
+            return "framing"
+    if not all(r["text"].strip() and .80 <= r["confidence"] <= 1 for r in regions):
+        return "uncertain"
+    return None
 
 
 def load_backend(kind, root):
@@ -92,7 +98,8 @@ def infer(kind, backend, frame):
     result = backend(frame)
     regions = [] if result.boxes is None else ordered_regions(result.boxes, result.txts, result.scores)
     return dict(text="\n".join(row["text"] for row in regions), regions=regions,
-                reliable=ocr_reliable(regions, frame.shape), engine="PP-OCRv5 mobile (ONNX)")
+                reliable=ocr_reliable(regions, frame.shape),
+                failure_reason=ocr_failure_reason(regions, frame.shape), engine="PP-OCRv5 mobile (ONNX)")
 
 
 def _serve(kind, root, pipe):
@@ -125,10 +132,22 @@ class RequestModel:
     """One bounded request at a time; a hung inference can be killed safely."""
     def __init__(self, kind, root=None):
         self.kind, self.ready = kind, False
+        self.root = str(root or model_directory())
+        self.closed = False
         self.lock = threading.Lock()
+        self.lifecycle_lock = threading.RLock()
+        self._start()
+
+    def _start(self):
+        with self.lifecycle_lock:
+            if self.closed:
+                raise RuntimeError(f"{self.kind} stopped")
+            self._spawn()
+
+    def _spawn(self):
         context = mp.get_context("spawn")
         self.pipe, child = context.Pipe()
-        self.process = context.Process(target=_serve, args=(kind, str(root or model_directory()), child), daemon=True)
+        self.process = context.Process(target=_serve, args=(self.kind, self.root, child), daemon=True)
         self.process.start()
         child.close()
 
@@ -136,6 +155,12 @@ class RequestModel:
         if not self.lock.acquire(blocking=False):
             raise RuntimeError(f"{self.kind} is busy")
         try:
+            if self.closed:
+                raise RuntimeError(f"{self.kind} stopped")
+            if self.process.exitcode is not None:
+                self._stop()
+                self._start()
+                self.ready = False
             if not self.ready:
                 if not self.pipe.poll(0):
                     raise RuntimeError(f"{self.kind} is loading or unavailable")
@@ -143,26 +168,56 @@ class RequestModel:
                 if not status.get("ready"):
                     raise RuntimeError(status.get("error", "model unavailable"))
                 self.ready = True
-            self.pipe.send(frame)
-            if not self.pipe.poll(timeout):
-                self.close()
-                raise TimeoutError(f"{self.kind} exceeded {timeout}s; process stopped")
-            result = self.pipe.recv()
+            deadline = time.monotonic() + timeout
+            outcome = []
+            def exchange():
+                try:
+                    self.pipe.send(frame)
+                    if not self.pipe.poll(timeout):
+                        raise TimeoutError(f"{self.kind} exceeded {timeout}s; process stopped")
+                    outcome.append(self.pipe.recv())
+                except Exception as error:
+                    outcome.append(error)
+            self.io_thread = threading.Thread(target=exchange, name=f"{self.kind}-exchange", daemon=True)
+            self.io_thread.start()
+            self.io_thread.join(timeout=max(0, deadline - time.monotonic()))
+            if self.io_thread.is_alive():
+                self._stop()
+                raise TimeoutError(f"{self.kind} request exceeded {timeout}s; process stopped")
+            if isinstance(outcome[0], Exception):
+                self._stop()
+                raise outcome[0]
+            result = outcome[0]
             if "error" in result:
                 raise RuntimeError(result["error"])
             return result
         finally:
             self.lock.release()
 
-    def close(self):
+    def _stop(self):
+        with self.lifecycle_lock:
+            self._reap()
+
+    def _reap(self):
         if self.process.is_alive():
             self.process.terminate()
             self.process.join(timeout=.5)
             if self.process.is_alive():
                 self.process.kill()
                 self.process.join(timeout=.5)
+            if self.process.is_alive():
+                raise RuntimeError(f"{self.kind} could not be reaped; refusing restart")
+        io_thread = getattr(self, "io_thread", None)
+        if io_thread is not None:
+            io_thread.join(timeout=.5)
+            if io_thread.is_alive():
+                raise RuntimeError(f"{self.kind} pipe did not unblock; refusing restart")
         self.pipe.close()
         self.ready = False
+
+    def close(self):
+        self.closed = True
+        self._stop()
 
 
 def setup(root):

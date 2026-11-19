@@ -23,6 +23,7 @@ import pickle
 import numpy as np
 from pathlib import Path
 from contextlib import contextmanager
+from voice_capture import CaptureProcess, CaptureCleanupFailed
 
 # Optional USB microphone voice control.
 # Microphone capture uses SpeechRecognition/PyAudio, while speech-to-text uses
@@ -204,7 +205,7 @@ OPEN_VOCAB_CLASSES = tuple(
     for name in os.environ.get(
         "WHISPER_HAT_OPEN_VOCAB_CLASSES",
         "bed,chair,computer monitor,laptop,television,laundry basket,"
-        "cardboard box,bag of chips",
+        "cardboard box,bag of chips,book,pillow",
     ).split(",")
     if name.strip()
 )
@@ -600,10 +601,13 @@ ENABLE_OCR_READING = True
 VISION_COMMANDS_ENABLED = os.environ.get("WHISPER_HAT_VISION_COMMANDS", "1").strip().lower() in {"1", "true", "yes", "on"}
 CAPTION_TIMEOUT_SECONDS = float(os.environ.get("WHISPER_HAT_CAPTION_TIMEOUT", "40"))
 PPOCR_TIMEOUT_SECONDS = float(os.environ.get("WHISPER_HAT_PPOCR_TIMEOUT", "15"))
-OCR_FAILURE_MESSAGE = "I couldn't read that. Hold still and try again."
+OCR_FAILURE_MESSAGE = "I couldn't read that. Hold the whole page steady and try again."
+OCR_FRAMING_MESSAGE = "The page is cut off. Center the whole page, hold it steady, and try again."
 caption_model = None
 ppocr_model = None
 caption_worker_thread = None
+ocr_request_busy = threading.Event()
+scene_request_busy = threading.Event()
 OCR_BINARY = "tesseract"
 OCR_LANGUAGE = "eng"
 OCR_PSM = 3                      # 3 = fully automatic page segmentation
@@ -1963,16 +1967,19 @@ def raw_fake_distance_meters(class_name, x1, y1, x2, y2, frame_width, frame_heig
     return clamp(d, MIN_FAKE_DISTANCE_M, MAX_FAKE_DISTANCE_M), "area_fallback"
 
 
-def update_distance_memory(distance_key, raw_distance_m, update=True):
+def update_distance_memory(distance_key, raw_distance_m, update=True, source=None):
     now = time.time()
 
     with state_lock:
-        if distance_key not in distance_memory:
+        if (distance_key not in distance_memory or
+            (source is not None and distance_memory[distance_key].get("source") != source)):
             distance_memory[distance_key] = {
                 "raw_distance_m": raw_distance_m,
                 "smooth_distance_m": raw_distance_m,
                 "last_update_time": now,
                 "approach_mps": 0.0,
+                "source": source,
+                "closing_samples": deque(maxlen=6),
             }
             return raw_distance_m, 0.0
 
@@ -1996,6 +2003,34 @@ def update_distance_memory(distance_key, raw_distance_m, update=True):
         mem["approach_mps"] = approach_mps
 
         return smooth, approach_mps
+
+
+def sustained_closing_speed(distance_key, raw_distance_m, source, track_id, snapshot, update):
+    """Approach speech needs distinct, fresh depth samples on one stable track."""
+    with state_lock:
+        mem = distance_memory.get(distance_key)
+        if mem is None:  # Detection may have been switched off between scoring steps.
+            return 0.0
+        samples = mem.setdefault("closing_samples", deque(maxlen=6))
+        if source != "tof" or track_id == -1 or not snapshot or not snapshot.get("fresh"):
+            samples.clear()
+            mem["closing_speed"] = 0.0
+            return 0.0
+        stamp = snapshot.get("last_update")
+        if stamp is None:
+            stamp = time.time() - snapshot["age_seconds"]
+        if not update or (samples and stamp == samples[-1][0]):
+            return mem.get("closing_speed", 0.0)
+        if samples and (stamp <= samples[-1][0] or stamp - samples[-1][0] > .8):
+            samples.clear()
+        samples.append((stamp, raw_distance_m))
+        speed = 0.0
+        if len(samples) >= 4 and .6 <= samples[-1][0] - samples[0][0] <= 3:
+            steps = [(b[1] - a[1]) for a, b in zip(samples, list(samples)[1:])]
+            if all(step <= .02 for step in steps) and samples[0][1] - samples[-1][1] >= .2:
+                speed = (samples[0][1] - samples[-1][1]) / (samples[-1][0] - samples[0][0])
+        mem["closing_speed"] = speed
+        return speed
 
 
 def estimate_motion(track_id):
@@ -2261,17 +2296,17 @@ def score_risk(
         distance_key=distance_key,
         raw_distance_m=raw_distance_m,
         update=update_distance,
+        source=distance_source,
     )
+    approach_mps = sustained_closing_speed(distance_key, raw_distance_m, distance_source,
+                                          track_id, tof_snapshot, update_distance)
 
     distance_level = visual_distance_level(distance_m)
 
     approaching_by_distance = approach_mps > APPROACHING_MPS
     fast_approaching_by_distance = approach_mps > FAST_APPROACHING_MPS
-    approaching_by_size = area_growth > AREA_GROWTH_APPROACHING
-    fast_approaching_by_size = area_growth > AREA_GROWTH_FAST
-
-    approaching = approaching_by_distance or approaching_by_size
-    fast_approaching = fast_approaching_by_distance or fast_approaching_by_size
+    approaching = approaching_by_distance
+    fast_approaching = fast_approaching_by_distance
 
     if approach_mps > 0.10:
         ttc_seconds = distance_m / approach_mps
@@ -2558,6 +2593,7 @@ def should_alert(alert_key, risk, reason, distance_m=None):
     global last_global_alert_time, last_alert_decision
 
     is_unknown = alert_key.startswith("tof:unknown:")
+    is_static = reason.startswith(tuple(f"{name} " for name in STATIC_OBSTACLE_CLASSES))
     last_alert_decision = {
         "alert_key": alert_key,
         "risk": risk,
@@ -2611,13 +2647,14 @@ def should_alert(alert_key, risk, reason, distance_m=None):
         reason_changed = reason != mem.get("last_alert_reason")
         previous_distance = mem.get("last_alert_distance_m")
         materially_closer = (
-            is_unknown
+            (is_unknown or is_static)
             and previous_distance is not None
             and distance_m is not None
             and previous_distance - distance_m >= TOF_UNKNOWN_CLOSER_BYPASS_M
         )
         repeat_due = (
             REPEAT_ALERTS_WHILE_STILL_PRESENT
+            and not (is_unknown and risk < 3)
             and mem["last_alert_time"] > 0
             and now - mem["last_alert_time"] >= repeat_seconds
         )
@@ -2630,6 +2667,13 @@ def should_alert(alert_key, risk, reason, distance_m=None):
             materially_closer=materially_closer,
             repeat=repeat_due,
         )
+
+        if (is_static and risk < 3 and not never_spoken and not risk_escalated
+            and not materially_closer and "getting closer" not in reason):
+            # Keep the last spoken caution as the reference: distance-band or
+            # left/right wording jitter must not alternate notice/caution forever.
+            last_alert_decision["suppressed_by"] = "unchanged_static_obstacle"
+            return False
 
         should_speak = never_spoken or risk_escalated or repeat_due
         if materially_closer:
@@ -3245,8 +3289,8 @@ def set_detection_enabled(enabled, announce=True):
         else:
             detection_enabled_event.clear()
             # Serialize OFF cancellation with on-demand scene speech enqueueing.
-            clear_waiting_speech()
-            interrupt_current_speech(force=True)
+            clear_waiting_speech(keep_protected=True)
+            interrupt_current_speech()
             track_memory.clear()
             distance_memory.clear()
             track_history.clear()
@@ -3310,7 +3354,7 @@ def _check_voice_recovery():
 
 
 class _OwnedVoiceStream:
-    """Keep native calls in the listener, including calibration chunk reads."""
+    """Keep the bounded capture supervisor in one listener, including calibration."""
 
     def __init__(self, stream):
         self.stream = stream
@@ -3321,8 +3365,6 @@ class _OwnedVoiceStream:
         if threading.get_ident() != self.owner or self.closed:
             raise RuntimeError("microphone read outside its live owner")
         _check_voice_recovery()
-        # ponytail: blocking PyAudio read has no timeout/cancel API. A native
-        # hang stays pending; hard recovery deadlines require process isolation.
         data = self.stream.read(size)
         _check_voice_recovery()
         return data
@@ -3335,60 +3377,57 @@ class _OwnedVoiceStream:
             self.stream.close()
 
 
+def _capture_audio_progress(data, stamp):
+    """Drain capture during playback; only the recognizer's copy is silenced."""
+    global voice_last_audio_monotonic
+    voice_last_audio_monotonic = time.monotonic()
+    _voice_heartbeat(voice_listener_stage)
+    if speech_active_event.is_set() or (
+        speech_last_end_time > 0 and time.time() - speech_last_end_time < max(.25, VOICE_PLAYBACK_COOLDOWN_SECONDS)
+    ):
+        return bytes(len(data))
+    return data
+
+
 def _open_voice_source(mic_index):
-    """Open the mic, trying fallback capture rates before giving up.
-
-    A USB mic can open successfully at a requested rate that the hardware does
-    not actually run at, which makes Vosk decode shifted speech. Logging the
-    source rate makes that visible. The fallback list only applies when opening
-    raises, so it never changes a working baseline configuration.
-    """
-    rates = []
-    for rate in (VOICE_MIC_SAMPLE_RATE, *VOICE_MIC_FALLBACK_RATES):
-        rate = int(rate)
-        if rate > 0 and rate not in rates:
-            rates.append(rate)
-
+    """Only a supervised child owns PortAudio; never reopen an unreaped owner."""
+    rates = list(dict.fromkeys(int(rate) for rate in
+                 (VOICE_MIC_SAMPLE_RATE, *VOICE_MIC_FALLBACK_RATES) if int(rate) > 0))
     errors = []
     for rate in rates:
         _check_voice_recovery()
-        microphone = None
+        capture = None
         try:
-            with suppress_audio_stderr():
-                microphone = sr.Microphone(
-                    device_index=mic_index,
-                    sample_rate=rate,
-                )
-                source = microphone.__enter__()
-            if source.stream is None:
-                raise RuntimeError("microphone backend returned no open stream")
-            name = _voice_microphone_name(mic_index)
-            print(
-                f"[voice control] Microphone open: index={mic_index} "
-                f"name={name!r} requested={rate}Hz "
-                f"source={source.SAMPLE_RATE}Hz "
-                f"chunk={source.CHUNK} width={source.SAMPLE_WIDTH}",
-                flush=True,
-            )
-            _voice_debug(
-                "mic_open",
-                index=mic_index,
-                rate=rate,
-                source_rate=source.SAMPLE_RATE,
-                chunk=source.CHUNK,
-                sample_width=source.SAMPLE_WIDTH,
-            )
-            return source, microphone, rate
+            capture = CaptureProcess(mic_index, rate, check=_check_voice_recovery,
+                                     on_audio=_capture_audio_progress)
+            class Source(sr.AudioSource):
+                def __init__(self):
+                    pass
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    capture.close()
+            source = Source()
+            source.stream = capture
+            source.SAMPLE_RATE = capture.info["rate"]
+            source.SAMPLE_WIDTH = capture.info["width"]
+            source.CHUNK = capture.info["chunk"]
+            print(f"[voice control] Microphone open: owner_pid={capture.process.pid} "
+                  f"index={mic_index} name={capture.info['name']!r} requested={rate}Hz "
+                  f"source={source.SAMPLE_RATE}Hz chunk={source.CHUNK} width={source.SAMPLE_WIDTH} "
+                  "backend=supervised-portaudio", flush=True)
+            return source, capture, rate
+        except CaptureCleanupFailed as error:
+            raise _VoiceCleanupFailed(str(error)) from error
+        except _VoiceRecoveryRequested:
+            raise
         except Exception as error:
-            errors.append(f"{rate}Hz: {type(error).__name__}: {error}")
-            if microphone is not None and getattr(microphone, "stream", None) is not None:
+            if capture is not None:
                 try:
-                    with suppress_audio_stderr():
-                        microphone.__exit__(None, None, None)
-                except Exception as cleanup_error:
+                    capture.close()
+                except CaptureCleanupFailed as cleanup_error:
                     raise _VoiceCleanupFailed(str(cleanup_error)) from cleanup_error
-            _voice_debug("mic_open_failed", index=mic_index, rate=rate, error=error)
-
+            errors.append(f"{rate}Hz: {type(error).__name__}: {error}")
     raise RuntimeError("; ".join(errors) or "no capture rate available")
 
 
@@ -3479,13 +3518,16 @@ def _trigger_scene_description():
     global last_scene_describe_time, scene_last_trigger_monotonic, voice_scene_triggers
     if not ENABLE_SCENE_DESCRIBE:
         return False
-    now = time.time()
-    if now - last_scene_describe_time < SCENE_DESCRIBE_COOLDOWN_SECONDS:
+    if scene_request_busy.is_set() or scene_describe_event.is_set():
+        _play_direct_response("I'm still describing the scene. Please wait.")
         return True
-    last_scene_describe_time = now
+    scene_request_busy.set()
+    last_scene_describe_time = time.time()
     scene_last_trigger_monotonic = time.monotonic()
     voice_scene_triggers += 1
+    _play_direct_response("Looking.", origin_perf=scene_last_trigger_monotonic)
     scene_describe_event.set()
+    _voice_debug("scene_triggered")
     return True
 
 
@@ -3493,6 +3535,7 @@ def _respond_to_scene(frame, fallback, origin_perf):
     """The camera/hazard loop only hands off pixels; it never waits for a caption."""
     global caption_worker_thread
     if caption_model is None:
+        scene_request_busy.clear()
         return _play_direct_response(fallback, 2, origin_perf=origin_perf, origin_label="command")
 
     def respond():
@@ -3502,10 +3545,14 @@ def _respond_to_scene(frame, fallback, origin_perf):
         except Exception as error:
             print(f"[caption] fallback: {type(error).__name__}: {error}", flush=True)
             text = fallback
-        if not ocr_stop_event.is_set():
-            _play_direct_response(text, 2, origin_perf=origin_perf, origin_label="command")
+        try:
+            if not ocr_stop_event.is_set():
+                _play_direct_response(text, 2, origin_perf=origin_perf, origin_label="command")
+        finally:
+            scene_request_busy.clear()
 
     if caption_worker_thread is not None and caption_worker_thread.is_alive():
+        _play_direct_response("I'm still describing the scene. Please wait.")
         return
     caption_worker_thread = threading.Thread(target=respond, name="scene-caption-request", daemon=True)
     caption_worker_thread.start()
@@ -3636,6 +3683,7 @@ def _voice_control_worker():
     global voice_audio_frames, voice_audio_bytes, voice_audio_timeouts
     global voice_nonempty_results, voice_last_audio_monotonic
     global voice_last_processed_monotonic
+    global voice_recovery_count, voice_last_recovery_monotonic
 
     if sr is None:
         print(
@@ -3722,17 +3770,6 @@ def _voice_control_worker():
             while not voice_control_stop_event.is_set():
                 _check_voice_recovery()
                 _voice_heartbeat("listening")
-                cooldown = _voice_playback_cooldown_remaining()
-                if cooldown > 0.0:
-                    _voice_debug(
-                        "playback_cooldown_wait",
-                        seconds=round(cooldown, 3),
-                        tts_active=speech_active_event.is_set(),
-                    )
-                    voice_control_stop_event.wait(cooldown)
-                    if voice_control_stop_event.is_set():
-                        break
-
                 listen_started = time.monotonic()
                 stream = getattr(source, "stream", None)
                 try:
@@ -3829,13 +3866,8 @@ def _voice_control_worker():
                     _voice_debug("command_ignored", reason=reason, tts_overlap=tts_overlap)
                     continue
 
-                if tts_overlap:
-                    print(
-                        "[voice notice] Speech was captured while TTS was active; "
-                        "retest with the speaker muted before changing the recognizer.",
-                        flush=True,
-                    )
-
+                # Speaker PCM was already silenced at capture consumption.
+                # A warning starting after the user's utterance must not erase it.
                 _apply_voice_command(text)
 
         except _VoiceRecoveryRequested:
@@ -3846,6 +3878,10 @@ def _voice_control_worker():
         except Exception as error:
             if voice_control_stop_event.is_set():
                 break
+            if source is not None:
+                recovery_waiting_for_audio = True
+                voice_recovery_count += 1
+                voice_last_recovery_monotonic = time.monotonic()
             _voice_heartbeat("error")
             print(f"[voice control] Offline microphone/recognition error: {error}")
             if source is None:
@@ -3859,8 +3895,7 @@ def _voice_control_worker():
             if microphone is not None:
                 _voice_heartbeat("closing")
                 try:
-                    with suppress_audio_stderr():
-                        microphone.__exit__(None, None, None)
+                    microphone.__exit__(None, None, None)
                 except Exception as error:
                     voice_listener_cleanup_failed.set()
                     print(f"[voice control] microphone teardown failed; no reopen: {error}", flush=True)
@@ -3883,11 +3918,7 @@ def _voice_control_worker():
 
 
 def _force_unblock_voice_stream():
-    """Request cooperative recovery; never touch another thread's stream.
-
-    Historical name retained for diagnostic callers. This cannot forcibly
-    unblock a native PyAudio read; only the owner may perform teardown.
-    """
+    """Request recovery; bounded pipe reads return control to the supervisor."""
     global voice_recovery_request_time
     with voice_listener_source_lock:
         if voice_control_stop_event.is_set() or voice_recovery_requested.is_set():
@@ -3955,9 +3986,7 @@ def _voice_watchdog_check(now=None):
         ):
             voice_recovery_pending_reported.set()
             print(
-                "[voice watchdog] recovery still pending: owner has not reached a safe point. "
-                "Blocking native calls cannot be safely interrupted; no replacement will open "
-                "until owner teardown completes.",
+                "[voice watchdog] recovery still pending; no replacement until capture owner is reaped.",
                 flush=True,
             )
         return False
@@ -4106,7 +4135,7 @@ def stop_voice_control():
         voice_listener_stage = "shutdown_pending"
         print(
             "[voice control] shutdown pending: owner has not completed; "
-            "no cross-thread teardown or reopen. If a native call never returns, process exit is required.",
+            "no replacement may open before the capture process is reaped.",
             flush=True,
         )
         return False
@@ -4385,6 +4414,19 @@ def _ocr_quality_ok(metrics):
     )
 
 
+def _ocr_page_reliable(metrics, shape):
+    """Reject clipped framing and pages with too many uncertain words."""
+    box = metrics.get("text_box")
+    height, width = shape[:2]
+    if box is not None:
+        x1, y1, x2, y2 = box
+        if x1 <= 1 or y1 <= 1 or x2 >= width - 2 or y2 >= height - 2:
+            return False
+    if metrics.get("word_count", 0) >= 12:
+        return metrics.get("mean_conf", 0) >= 80 and metrics.get("good_word_ratio", 0) >= .9
+    return True
+
+
 def _parse_tesseract_tsv(output):
     """Parse Tesseract TSV into text, word confidences, and metrics."""
     lines = []
@@ -4572,10 +4614,13 @@ def _perform_ocr_read(source):
         return
 
     neural_result = None
+    failure_message = OCR_FAILURE_MESSAGE
     if ppocr_model is not None:
         try:
             neural_result = ppocr_model.request(neural_frame, PPOCR_TIMEOUT_SECONDS)
             if not neural_result.get("reliable"):
+                if neural_result.get("failure_reason") == "framing":
+                    failure_message = OCR_FRAMING_MESSAGE
                 raise ValueError("PP-OCRv5 regions did not pass the confidence gate")
             if dump_path is not None:
                 neural_dump = dump_path.with_name(dump_path.name.replace("tesseract-input", "ppocr-input"))
@@ -4609,7 +4654,9 @@ def _perform_ocr_read(source):
         return
 
     text = " ".join(raw_text.split())
-    quality_ok = neural_result is not None or _ocr_quality_ok(metrics)
+    quality_ok = failure_message != OCR_FRAMING_MESSAGE and (
+        neural_result is not None or (_ocr_quality_ok(metrics) and _ocr_page_reliable(metrics, frame.shape))
+    )
     _voice_debug(
         "ocr_tesseract_done",
         raw_chars=len(raw_text),
@@ -4633,7 +4680,7 @@ def _perform_ocr_read(source):
     )
     if not text:
         _play_direct_response(
-            OCR_FAILURE_MESSAGE,
+            failure_message,
             origin_perf=ocr_last_trigger_monotonic,
         )
         return
@@ -4645,18 +4692,27 @@ def _perform_ocr_read(source):
             elapsed_s=round(time.monotonic() - started, 3),
         )
         _play_direct_response(
-            OCR_FAILURE_MESSAGE,
+            failure_message,
             origin_perf=ocr_last_trigger_monotonic,
         )
         return
 
+    # Bound the answer and its enqueue time; a long page must not strand later commands.
+    full_text = text
+    text = _clean_ocr_text(text)
+    if len(text) < len(full_text):
+        text += " There is more text. Frame a shorter section to read the rest."
     chunks = _split_ocr_speech_chunks(text, verbatim=True)
+    enqueue_deadline = time.monotonic() + 15
     queued_count = 0
     for index, chunk in enumerate(chunks):
         # Feed long readings gradually from this worker, reserving queue space
         # for warnings. Never make the camera, microphone or speech worker wait.
         while speech_queue.qsize() >= 2:
             if ocr_stop_event.wait(.05):
+                return
+            if time.monotonic() >= enqueue_deadline:
+                _play_direct_response("Reading stopped. Please read a shorter section.")
                 return
         queued = _play_direct_response(
             chunk,
@@ -4698,16 +4754,15 @@ def _trigger_ocr_reading():
     if not ENABLE_OCR_READING:
         _voice_debug("ocr_trigger_ignored", reason="disabled")
         return False
-    now = time.time()
-    if now - last_ocr_trigger_time < OCR_TRIGGER_COOLDOWN_SECONDS:
-        _voice_debug(
-            "ocr_trigger_debounced",
-            remaining_s=round(OCR_TRIGGER_COOLDOWN_SECONDS - (now - last_ocr_trigger_time), 3),
-        )
+    if ocr_request_busy.is_set() or ocr_trigger_event.is_set():
+        _play_direct_response("I'm still reading. Please wait.")
         return True
+    ocr_request_busy.set()
+    now = time.time()
     last_ocr_trigger_time = now
     ocr_last_trigger_monotonic = time.monotonic()
     voice_ocr_triggers += 1
+    _play_direct_response("Reading.", origin_perf=ocr_last_trigger_monotonic)
     ocr_trigger_event.set()
     _voice_debug(
         "ocr_triggered",
@@ -4732,6 +4787,10 @@ def _ocr_reader_worker():
         except Exception as error:
             print(f"[ocr] Reader error: {type(error).__name__}: {error}", flush=True)
             _voice_debug("ocr_worker_error", error=f"{type(error).__name__}: {error}")
+            if not ocr_stop_event.is_set():
+                _play_direct_response(OCR_FAILURE_MESSAGE, origin_perf=ocr_last_trigger_monotonic)
+        finally:
+            ocr_request_busy.clear()
 
 
 def start_ocr_reader(source):
@@ -6336,7 +6395,6 @@ def main():
             describe_requested = (
                 ENABLE_SCENE_DESCRIBE
                 and scene_describe_event.is_set()
-                and (not detection_enabled or last_detections is not None)
             )
             scene_objects = None
             if describe_requested:
@@ -6790,7 +6848,7 @@ def main():
                     description = (
                         _compose_scene_description(scene_objects)
                         if detection_enabled and detection_is_enabled()
-                        else "Detection is off."
+                        else "I couldn't describe that scene. Please try again."
                     )
                     _respond_to_scene(naming_frame.copy(), description, scene_last_trigger_monotonic)
 

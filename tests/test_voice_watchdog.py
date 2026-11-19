@@ -153,25 +153,13 @@ def test_open_fallback_stops_when_partial_stream_teardown_fails(new, monkeypatch
     _prepare_watchdog(new, monkeypatch)
     opened, exited = [], []
 
-    class Microphone:
-        def __init__(self, **kwargs):
-            opened.append(kwargs)
-            self.stream = object()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            exited.append(True)
-            raise OSError("native close failed")
-
-    monkeypatch.setattr(new, "sr", SimpleNamespace(Microphone=Microphone))
-    monkeypatch.setattr(new, "suppress_audio_stderr", nullcontext)
-    monkeypatch.setattr(new, "_voice_microphone_name", lambda index: "fake mic")
-    # Missing SAMPLE_RATE makes the partially opened source fail validation/logging.
-    with pytest.raises(new._VoiceCleanupFailed, match="native close failed"):
+    def failed_capture(*args, **kwargs):
+        opened.append(True)
+        raise new.CaptureCleanupFailed("owner not reaped")
+    monkeypatch.setattr(new, "CaptureProcess", failed_capture)
+    with pytest.raises(new._VoiceCleanupFailed, match="owner not reaped"):
         new._open_voice_source(0)
-    assert len(opened) == len(exited) == 1
+    assert len(opened) == 1
 
 
 def test_watchdog_clears_stale_playback_suppression(new, monkeypatch):

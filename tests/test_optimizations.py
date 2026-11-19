@@ -133,7 +133,7 @@ def test_prompted_yoloe_default_and_explicit_opt_out(new, monkeypatch, override,
     assert config["OPEN_VOCAB_PROMPT_FREE"] is False
     assert config["OPEN_VOCAB_CLASSES"] == (
         "bed", "chair", "computer monitor", "laptop", "television",
-        "laundry basket", "cardboard box", "bag of chips",
+        "laundry basket", "cardboard box", "bag of chips", "book", "pillow",
     )
 
 

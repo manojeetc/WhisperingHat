@@ -5,16 +5,20 @@ speaks its first short sentence. `Read this` uses PP-OCRv5 mobile detection and
 English recognition through RapidOCR/ONNX Runtime. Detected quadrilaterals are
 perspective-rectified by RapidOCR, then read top-to-bottom and left-to-right.
 This is single-column reading order, not a multi-column document layout model.
-Words are not paraphrased, corrected, or silently truncated at 600 characters.
+Words are not paraphrased or corrected. A reading is capped at 600 characters
+with an explicit spoken notice when more text remains.
 
 These models load into separate low-priority processes. Inference occurs only
 on request, uses one CPU thread per model, and never runs in the microphone or
 hazard loop. Caption loading/failure/deadline uses the existing detector-based
 description. PP loading/failure/unreliable regions/deadline uses Tesseract with
-its existing quality gate. If both fail, speech is exactly:
-`I couldn't read that. Hold still and try again.` PP requires all regions at
+its language gate plus clipped-page and long-page confidence checks. If both
+fail, speech is: `I couldn't read that. Hold the whole page steady and try again.`
+PP requires all regions at
 least 0.80 confidence and rejects edge-touching text; this cannot guarantee
 that a confidently recognized word is correct or that all text was detected.
+Detected edge clipping gets a specific request to center the whole page, even
+if the fallback recognizes a confident interior fragment.
 
 Picamera2 uses a simultaneous 1920x1440 main stream and 640x480 YUV preview
 (the existing dimension settings still apply). The camera owner copies the
@@ -25,9 +29,11 @@ needs Pi validation for frame cadence, field of view, color and resource use.
 The concurrent path requires the existing latest-frame capture worker; when
 that worker is disabled, the prior camera path remains available.
 
-Long readings feed the existing speech queue gradually, leaving queue capacity
-for hazards. Existing speech priority, STOP interruption, ToF, YOLOE, boot and
-microphone recovery logic are unchanged. Separate processes avoid synchronous
+Accepted requests say `Reading.` or `Looking.` immediately through the speech
+queue. Each feature accepts one outstanding request; another request gets a
+spoken busy response. OCR enqueueing has a 15-second deadline, leaving capacity
+for hazards. Detection-off preserves command responses and captioning still runs.
+Existing STOP interruption, ToF, YOLOE and boot settings are retained. Separate processes avoid synchronous
 inference waits in those loops; CPU/memory contention still needs measurement
 on the Pi. No claim of unchanged real-time performance is made from Windows.
 
@@ -85,8 +91,10 @@ light. Check `[caption]` and `[ocr] PP-OCRv5` output, then the existing
 `WHISPER_HAT_LATENCY_DEBUG=1`). Loading or a deadline never counts as a model
 success. The default caption deadline is 40 seconds; OCR is 15 seconds before
 Tesseract fallback. Override with `WHISPER_HAT_CAPTION_TIMEOUT` and
-`WHISPER_HAT_PPOCR_TIMEOUT` (seconds). A timed-out process stays disabled until
-restart, avoiding runaway background inference or overlapping replacement work.
+`WHISPER_HAT_PPOCR_TIMEOUT` (seconds). A timed-out process is terminated and
+reaped. The next request starts a replacement; requests during loading get the
+fallback, and subsequent ready requests can run normally. Input pipe writes
+are included in the deadline. Shutdown prevents restarting a model.
 The two-second warm command-to-speech target is **not demonstrated**.
 
 Switch back: stop with Ctrl+C, then run the existing description and Tesseract

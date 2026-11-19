@@ -19,6 +19,8 @@ def test_caption_one_sentence_and_ocr_gate():
     assert not vision.ocr_reliable([])
     assert not vision.ocr_reliable([dict(text="Clipped", confidence=.99,
         box=[[4, 4], [16, 4], [16, 19], [4, 19]])], (20, 20, 3))
+    assert vision.ocr_failure_reason([dict(text="Clipped", confidence=.99,
+        box=[[4, 4], [16, 4], [16, 19], [4, 19]])], (20, 20, 3)) == "framing"
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -114,23 +116,73 @@ def test_ocr_dump_write_failure_does_not_discard_neural_text(new, monkeypatch, t
     assert spoken == ["Readable text."]
 
 
-def test_request_timeout_stops_child_and_loading_falls_back():
+def test_clipped_page_gives_specific_retry_instead_of_partial_text(new, monkeypatch):
+    spoken = []
+    result = dict(text="Part of a page", reliable=False, failure_reason="framing")
+    monkeypatch.setattr(new, "ppocr_model", SimpleNamespace(request=lambda *a: result))
+    monkeypatch.setattr(new, "_grab_ocr_frame", lambda s: np.zeros((80, 80, 3), np.uint8))
+    monkeypatch.setattr(new, "_begin_ocr_dump", lambda *a: None)
+    monkeypatch.setattr(new, "_ocr_available", lambda: True)
+    words = [("Readable", 99), ("fragment", 99)]
+    monkeypatch.setattr(new, "_run_tesseract_tsv", lambda frame:
+                        ("Readable fragment", words, new._ocr_text_metrics("Readable fragment", words)))
+    monkeypatch.setattr(new, "_play_direct_response", lambda text, **kw: spoken.append(text) or True)
+    new._perform_ocr_read(None)
+    assert spoken == [new.OCR_FRAMING_MESSAGE]
+
+
+def test_request_timeout_stops_child_and_next_request_restarts(monkeypatch):
     model = vision.RequestModel.__new__(vision.RequestModel)
     calls = []
     model.kind, model.ready, model.lock = "ocr", True, threading.Lock()
+    model.closed = False
+    model.lifecycle_lock = threading.RLock()
     model.pipe = SimpleNamespace(send=lambda frame: calls.append("send"), poll=lambda timeout: False,
                                  close=lambda: calls.append("close"))
     alive = [True]
-    model.process = SimpleNamespace(is_alive=lambda: alive[0],
+    model.process = SimpleNamespace(is_alive=lambda: alive[0], exitcode=None,
         terminate=lambda: (calls.append("terminate"), alive.__setitem__(0, False)),
         join=lambda timeout: calls.append("join"))
     with pytest.raises(TimeoutError):
         model.request("pixels", .01)
     assert calls == ["send", "terminate", "join", "close"]
     calls.clear()
+    model.process.exitcode = -15
+    def restart():
+        calls.append("restart")
+        model.process = SimpleNamespace(exitcode=None)
+    monkeypatch.setattr(model, "_start", restart)
     with pytest.raises(RuntimeError, match="loading"):
         model.request("pixels", .01)
-    assert not calls
+    assert calls == ["close", "restart"]
+    # A subsequent ready replacement serves actual results, not a permanent fallback.
+    model.pipe = SimpleNamespace(poll=lambda timeout: True, send=lambda frame: None,
+        recv=iter([dict(ready=True), dict(text="A chair.")]).__next__)
+    assert model.request("pixels", .01)["text"] == "A chair."
+    model.closed = True
+    with pytest.raises(RuntimeError, match="stopped"):
+        model.request("pixels", .01)
+
+
+@pytest.mark.parametrize("blocked_stage", ["send", "recv"])
+def test_input_and_result_pipe_io_are_bounded(blocked_stage):
+    model = vision.RequestModel.__new__(vision.RequestModel)
+    model.kind, model.ready, model.closed = "ocr", True, False
+    model.lock, model.lifecycle_lock = threading.Lock(), threading.RLock()
+    released, entered = threading.Event(), threading.Event()
+    alive = [True]
+    def block(*args):
+        entered.set()
+        assert released.wait(2)
+        raise BrokenPipeError()
+    model.pipe = SimpleNamespace(send=block if blocked_stage == "send" else lambda frame: None,
+        poll=lambda timeout: True, recv=block, close=lambda: None)
+    model.process = SimpleNamespace(exitcode=None, is_alive=lambda: alive[0],
+        terminate=lambda: (released.set(), alive.__setitem__(0, False)), join=lambda timeout: None)
+    with pytest.raises(TimeoutError, match="exceeded"):
+        model.request("pixels", .02)
+    assert entered.is_set() and not model.io_thread.is_alive()
+    assert not alive[0]
 
 
 def test_concurrent_still_uses_next_camera_request_without_mode_switch(new, monkeypatch):

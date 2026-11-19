@@ -56,6 +56,9 @@ def test_empty_description(new):
 
 
 def _reset_voice_state(new, monkeypatch):
+    new.ocr_request_busy.clear()
+    new.scene_request_busy.clear()
+    monkeypatch.setattr(new, "_play_direct_response", lambda *a, **kw: True)
     monkeypatch.setattr(new, "ENABLE_SCENE_DESCRIBE", True)
     monkeypatch.setattr(new, "ENABLE_OCR_READING", True)
     monkeypatch.setattr(new, "scene_describe_event", threading.Event())
@@ -81,7 +84,7 @@ def test_read_phrase_sets_only_ocr_event(new, monkeypatch, frozen_time, phrase):
     assert not new.scene_describe_event.is_set()
 
 
-def test_scene_trigger_debounces_and_accepts_later_request(new, monkeypatch):
+def test_scene_trigger_reports_busy_then_accepts_after_completion(new, monkeypatch):
     _reset_voice_state(new, monkeypatch)
     monkeypatch.setattr(new.time, "time", lambda: 1000.0)
     assert new._trigger_scene_description() is True
@@ -90,6 +93,7 @@ def test_scene_trigger_debounces_and_accepts_later_request(new, monkeypatch):
     monkeypatch.setattr(new.time, "time", lambda: 1000.5)
     assert new._trigger_scene_description() is True
     assert not new.scene_describe_event.is_set()
+    new.scene_request_busy.clear()  # Worker has completed, not just consumed the event.
     monkeypatch.setattr(new.time, "time", lambda: 1003.0)
     assert new._trigger_scene_description() is True
     assert new.scene_describe_event.is_set()
@@ -177,6 +181,7 @@ def test_main_describes_once_without_extra_inference(new, monkeypatch, frozen_ti
         return True
 
     monkeypatch.setattr(new, "play_alert_sound", speak)
+    monkeypatch.setattr(new, "_play_direct_response", lambda text, risk=2, **kw: speak(risk, text))
 
     class Camera:
         count = 0
@@ -219,9 +224,14 @@ def test_main_describes_once_without_extra_inference(new, monkeypatch, frozen_ti
     monkeypatch.setattr(new, "score_risk", score_with_pause)
     try:
         new.main()
+        if describe_requested:
+            if request_frame == 1 and detection_enabled:
+                expected = [(2, "I don't see anything ahead.")]
+            expected = [(risk, "I couldn't describe that scene. Please try again." if text == "Detection is off." else text)
+                        for risk, text in expected]
+            expected = [(2, "Looking."), *expected]
         assert spoken == expected
-        reply_frame = max(3, request_frame) if detection_enabled else request_frame
-        assert speech_frames == ([reply_frame] if describe_requested else [])
+        assert speech_frames == ([request_frame, request_frame] if describe_requested else [])
         scheduled_frames = [3] if pause_during_scoring else [3, 6]
         assert inference_frames == (scheduled_frames if detection_enabled else [])
         assert not new.scene_describe_event.is_set()

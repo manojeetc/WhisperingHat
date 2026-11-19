@@ -69,6 +69,8 @@ def reset_state(mod, grid=None, now=1000.0):
     mod.last_alert_decision = {}
     mod.scene_last_trigger_monotonic = 0.0
     mod.ocr_last_trigger_monotonic = 0.0
+    mod.ocr_request_busy.clear()
+    mod.scene_request_busy.clear()
     mod.reset_unknown_obstacle_state()
     mod.last_unknown_debug_time = 0.0
     mod._set_speech_active(False)
