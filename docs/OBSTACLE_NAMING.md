@@ -17,6 +17,12 @@ The main detector now defaults to prompted `yoloe-11s-seg.pt`; its first load
 may download weights and the text encoder. `WHISPER_HAT_OPEN_VOCAB=0` restores
 the YOLO11n main detector. No separate naming worker was added.
 
+The prompted default has 40 everyday classes, retaining book and pillow and
+adding people, furniture, household items, mobility aids and pets. Startup prints
+the effective labels. To replace the list, set the comma-separated
+`WHISPER_HAT_OPEN_VOCAB_CLASSES`, for example `book,cup,phone,bottle,chair`.
+An existing environment override takes precedence over the new default.
+
 Candidates must pass the existing corridor geometry and distance-association
 rule (`unknown_is_separate_from_known()` with the existing .45 m tolerance).
 Distance uses the existing `tof_distance_for_box()` mapping, with the existing

@@ -205,7 +205,10 @@ OPEN_VOCAB_CLASSES = tuple(
     for name in os.environ.get(
         "WHISPER_HAT_OPEN_VOCAB_CLASSES",
         "bed,chair,computer monitor,laptop,television,laundry basket,"
-        "cardboard box,bag of chips,book,pillow",
+        "cardboard box,bag of chips,book,pillow,person,table,desk,sofa,door,"
+        "cabinet,bookshelf,phone,keyboard,bottle,cup,backpack,suitcase,trash can,"
+        "shoe,cable,vacuum cleaner,plant,dog,cat,bicycle,walker,stroller,"
+        "traffic cone,sink,toilet,refrigerator,oven,microwave,stairs",
     ).split(",")
     if name.strip()
 )

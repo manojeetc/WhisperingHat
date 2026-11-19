@@ -134,6 +134,11 @@ def test_prompted_yoloe_default_and_explicit_opt_out(new, monkeypatch, override,
     assert config["OPEN_VOCAB_CLASSES"] == (
         "bed", "chair", "computer monitor", "laptop", "television",
         "laundry basket", "cardboard box", "bag of chips", "book", "pillow",
+        "person", "table", "desk", "sofa", "door", "cabinet", "bookshelf",
+        "phone", "keyboard", "bottle", "cup", "backpack", "suitcase", "trash can",
+        "shoe", "cable", "vacuum cleaner", "plant", "dog", "cat", "bicycle",
+        "walker", "stroller", "traffic cone", "sink", "toilet", "refrigerator",
+        "oven", "microwave", "stairs",
     )
 
 
@@ -154,6 +159,14 @@ def test_open_vocab_opt_out_loads_existing_detection_profile(new, monkeypatch):
     assert calls == [new.MODEL_NAME]
     assert new.DETECTION_CLASSES == new.YOLO_CLASSES_TO_KEEP
     assert new.DETECTION_IMG_SIZE == new.IMG_SIZE
+
+
+def test_indoor_vocabulary_remains_editable(new, monkeypatch):
+    import runpy
+    monkeypatch.setenv("WHISPER_HAT_OPEN_VOCAB_CLASSES", "book, cup, ,walker")
+    config = runpy.run_path(new.__file__)
+    assert config["OPEN_VOCAB_CLASSES"] == ("book", "cup", "walker")
+
 
 def test_open_vocab_yoloe_sets_fixed_classes(new, monkeypatch):
     record = {}
